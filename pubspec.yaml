@@ -1,5 +1,5 @@
 name: light_meter
-description: "A new Flutter project."
+description: "Android light meter — tap to sample EV, then solve shutter or aperture for film."
 # The following line prevents the package from being accidentally published to
 # pub.dev using `flutter pub publish`. This is preferred for private packages.
 publish_to: 'none' # Remove this line if you wish to publish to pub.dev
@@ -33,8 +33,10 @@ dependencies:
 
   cupertino_icons: ^1.0.8
   camera: ^0.11.2+3
-  image: ^4.5.3
   path_provider: ^2.1.5
+  exif: ^3.3.0
+  gal: ^2.3.3
+  image: ^4.9.1
 
 dev_dependencies:
   flutter_test:
