@@ -1,4 +1,4 @@
-import 'dart:math';
+import 'dart:async';
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 
@@ -26,35 +26,52 @@ class FilmFrameCaption {
   String get exposureLine => '$shutter  ·  $aperture  ·  ISO $iso';
 }
 
-/// Centre-crops [image] to a square, then keeps [fraction] of that square
-/// (still centred) to match a longer simulated focal length.
-ui.Rect sixBySixSourceRect(ui.Image image, double fraction) {
+/// Centre-crops [image] to [aspectRatio] (width÷height), then keeps
+/// [fraction] of that frame (still centred) for a longer simulated focal length.
+ui.Rect filmSourceRect(
+  ui.Image image, {
+  required double aspectRatio,
+  required double fraction,
+}) {
   final w = image.width.toDouble();
   final h = image.height.toDouble();
-  final side = min(w, h);
-  final left = (w - side) / 2;
-  final top = (h - side) / 2;
+  final aspect = aspectRatio <= 0 ? 1.0 : aspectRatio;
+
+  late final double frameW;
+  late final double frameH;
+  if (w / h > aspect) {
+    frameH = h;
+    frameW = h * aspect;
+  } else {
+    frameW = w;
+    frameH = w / aspect;
+  }
+
   final f = fraction.clamp(0.05, 1.0);
-  final kept = side * f;
-  final inset = (side - kept) / 2;
-  return ui.Rect.fromLTWH(left + inset, top + inset, kept, kept);
+  final keptW = frameW * f;
+  final keptH = frameH * f;
+  return ui.Rect.fromCenter(
+    center: ui.Offset(w / 2, h / 2),
+    width: keptW,
+    height: keptH,
+  );
 }
 
 /// Wraps a captured JPEG in a film-style border with exposure info.
 ///
 /// Orientation is baked from EXIF first so a portrait phone shot stays upright
 /// when drawn without an EXIF tag. When [cropFraction] is set, the photo is
-/// first reduced to a centred square and then to that fraction of the square,
-/// matching a 6×6 focal-length simulation.
+/// first reduced to [cropAspectRatio] and then to that fraction of the frame,
+/// matching a focal-length simulation on that film format.
+///
+/// Returns a high-quality JPEG at the full capture resolution (plus border).
 Future<Uint8List> stampFilmFrame({
   required Uint8List jpegBytes,
   required FilmFrameCaption caption,
   double? cropFraction,
+  double cropAspectRatio = 1.0,
 }) async {
-  final oriented = _bakeOrientation(jpegBytes);
-  final codec = await ui.instantiateImageCodec(oriented);
-  final frame = await codec.getNextFrame();
-  final photo = frame.image;
+  final photo = await _orientedUiImage(jpegBytes);
 
   try {
     final src = cropFraction == null
@@ -64,15 +81,24 @@ Future<Uint8List> stampFilmFrame({
             photo.width.toDouble(),
             photo.height.toDouble(),
           )
-        : sixBySixSourceRect(photo, cropFraction);
+        : filmSourceRect(
+            photo,
+            aspectRatio: cropAspectRatio,
+            fraction: cropFraction,
+          );
 
     final photoW = src.width;
     final photoH = src.height;
 
-    // Border scales with the long edge so it stays proportional.
+    // Scale matte and type with the long edge so 12 MP frames don't get a
+    // postage-stamp caption.
     final longEdge = photoW > photoH ? photoW : photoH;
-    final side = (longEdge * 0.04).clamp(24.0, 72.0);
-    final bottom = (longEdge * 0.14).clamp(90.0, 220.0);
+    final side = (longEdge * 0.045).clamp(28.0, 220.0);
+    final bottom = (longEdge * 0.155).clamp(110.0, 560.0);
+    final titleSize = (longEdge * 0.016).clamp(13.0, 56.0);
+    final exposureSize = (longEdge * 0.030).clamp(20.0, 96.0);
+    final secondarySize = (longEdge * 0.018).clamp(12.0, 56.0);
+    final titleTracking = (longEdge * 0.0025).clamp(1.5, 8.0);
 
     final outW = (photoW + side * 2).round();
     final outH = (photoH + side + bottom).round();
@@ -90,7 +116,7 @@ Future<Uint8List> stampFilmFrame({
       Paint()
         ..color = const Color(0xFF2A2A2A)
         ..style = PaintingStyle.stroke
-        ..strokeWidth = 1,
+        ..strokeWidth = (longEdge * 0.0015).clamp(1.0, 4.0),
     );
 
     canvas.drawImageRect(
@@ -105,13 +131,13 @@ Future<Uint8List> stampFilmFrame({
     final textMaxWidth = outW - side * 2;
 
     final titlePainter = TextPainter(
-      text: const TextSpan(
+      text: TextSpan(
         text: 'LIGHT METER',
         style: TextStyle(
-          color: Color(0xFFFFB300),
-          fontSize: 13,
+          color: const Color(0xFFFFB300),
+          fontSize: titleSize,
           fontWeight: FontWeight.w700,
-          letterSpacing: 2.4,
+          letterSpacing: titleTracking,
         ),
       ),
       textDirection: TextDirection.ltr,
@@ -120,11 +146,11 @@ Future<Uint8List> stampFilmFrame({
     final exposurePainter = TextPainter(
       text: TextSpan(
         text: caption.exposureLine,
-        style: const TextStyle(
+        style: TextStyle(
           color: Colors.white,
-          fontSize: 22,
+          fontSize: exposureSize,
           fontWeight: FontWeight.w700,
-          letterSpacing: 0.4,
+          letterSpacing: titleTracking * 0.2,
         ),
       ),
       textDirection: TextDirection.ltr,
@@ -144,9 +170,9 @@ Future<Uint8List> stampFilmFrame({
       secondaryPainter = TextPainter(
         text: TextSpan(
           text: secondary,
-          style: const TextStyle(
-            color: Color(0x99FFFFFF),
-            fontSize: 14,
+          style: TextStyle(
+            color: const Color(0x99FFFFFF),
+            fontSize: secondarySize,
             fontWeight: FontWeight.w500,
           ),
         ),
@@ -156,29 +182,29 @@ Future<Uint8List> stampFilmFrame({
       )..layout(maxWidth: textMaxWidth);
     }
 
+    final gapTitle = (longEdge * 0.008).clamp(6.0, 24.0);
+    final gapSecondary = (longEdge * 0.006).clamp(4.0, 18.0);
     final blockHeight = titlePainter.height +
-        8 +
+        gapTitle +
         exposurePainter.height +
-        (secondaryPainter != null ? 6 + secondaryPainter.height : 0);
+        (secondaryPainter != null
+            ? gapSecondary + secondaryPainter.height
+            : 0);
     var y = stripTop + (stripHeight - blockHeight) / 2;
 
     titlePainter.paint(canvas, Offset(side, y));
-    y += titlePainter.height + 8;
+    y += titlePainter.height + gapTitle;
     exposurePainter.paint(canvas, Offset(side, y));
     y += exposurePainter.height;
     if (secondaryPainter != null) {
-      y += 6;
+      y += gapSecondary;
       secondaryPainter.paint(canvas, Offset(side, y));
     }
 
     final picture = recorder.endRecording();
     final stamped = await picture.toImage(outW, outH);
     try {
-      final bytes = await stamped.toByteData(format: ui.ImageByteFormat.png);
-      if (bytes == null) {
-        throw StateError('Failed to encode stamped frame');
-      }
-      return bytes.buffer.asUint8List();
+      return await _encodeJpeg(stamped, quality: 98);
     } finally {
       stamped.dispose();
     }
@@ -187,17 +213,48 @@ Future<Uint8List> stampFilmFrame({
   }
 }
 
-Uint8List _bakeOrientation(Uint8List jpegBytes) {
+/// Decodes a capture, applies EXIF orientation, and uploads pixels to the GPU
+/// without a lossy JPEG round-trip.
+Future<ui.Image> _orientedUiImage(Uint8List jpegBytes) async {
   try {
     final decoded = img.decodeImage(jpegBytes);
     if (decoded == null) {
       throw const FormatException('Could not decode the captured image');
     }
     final upright = img.bakeOrientation(decoded);
-    return Uint8List.fromList(img.encodeJpg(upright, quality: 95));
+    final rgba = upright.convert(numChannels: 4);
+    final bytes = Uint8List.fromList(
+      rgba.getBytes(order: img.ChannelOrder.rgba),
+    );
+
+    final completer = Completer<ui.Image>();
+    ui.decodeImageFromPixels(
+      bytes,
+      rgba.width,
+      rgba.height,
+      ui.PixelFormat.rgba8888,
+      completer.complete,
+    );
+    return completer.future;
   } on FormatException {
     rethrow;
   } catch (e) {
     throw FormatException('Could not decode the captured image: $e');
   }
+}
+
+Future<Uint8List> _encodeJpeg(ui.Image image, {int quality = 98}) async {
+  final byteData = await image.toByteData(format: ui.ImageByteFormat.rawRgba);
+  if (byteData == null) {
+    throw StateError('Failed to read stamped frame pixels');
+  }
+  final rgba = img.Image.fromBytes(
+    width: image.width,
+    height: image.height,
+    bytes: byteData.buffer,
+    bytesOffset: byteData.offsetInBytes,
+    numChannels: 4,
+    order: img.ChannelOrder.rgba,
+  );
+  return Uint8List.fromList(img.encodeJpg(rgba, quality: quality));
 }

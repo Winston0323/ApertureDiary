@@ -77,13 +77,20 @@ the distance each one covers at the current aperture and ISO. Steps are one stop
 apart, so distances change by √2 between neighbours; the recommended setting is
 marked, and the subject distance is shown in the header for reference.
 
-## 6×6 focal simulation
+## Focal simulation
 
-Tap **6×6** on the preview to switch to a square viewfinder. The app reads the
-phone's native focal length and sensor size (Camera2 on Android, with EXIF as a
-fallback), then centre-crops the live view so its field of view matches the
-selected 6×6 lens (40–250 mm). Zoom is taken into account. Saved frames use the
-same crop and stamp the simulated focal length on the border.
+A format bar above the preview selects **Off**, **36×24**, **645**, or **6×6**.
+With a format selected, pick a focal length and the live viewfinder crops to that
+film's aspect ratio and field of view. The app reads the phone's native focal
+length and sensor size (Camera2 on Android, EXIF as fallback). Zoom is taken
+into account. Saved frames use the same crop and stamp the format + focal
+length on the border.
+
+| Format | Frame | Default lens |
+| --- | --- | --- |
+| 36×24 | 36×24 mm (full frame) | 50 mm |
+| 645 | 56×41.5 mm | 75 mm |
+| 6×6 | 60×60 mm | 80 mm |
 
 The white shutter button on the preview captures the current frame, wraps it in
 a film-style border stamped with the shutter, aperture, and ISO from the
@@ -104,7 +111,8 @@ album in the device gallery.
 | --- | --- |
 | `lib/exposure.dart` | APEX exposure math, sRGB linearization, formatting |
 | `lib/metering.dart` | EXIF exposure parsing, spot → sensor mapping, patch sampling |
-| `lib/flash.dart` | Guide-number math and manual power settings |
+| `lib/film_format.dart` | Film formats + FOV / crop math |
+| `lib/lens_info.dart` | Android Camera2 / EXIF lens info |
 | `lib/flash_scale.dart` | Vertical power → distance axis |
 | `lib/units.dart` | Metre/foot conversion and number formatting |
 | `lib/number_input_dialog.dart` | Numeric entry dialog |

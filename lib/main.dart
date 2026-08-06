@@ -1,5 +1,5 @@
 import 'dart:io';
-import 'dart:math' show max, min;
+import 'dart:math' show max;
 
 import 'package:camera/camera.dart';
 import 'package:exif/exif.dart';
@@ -10,13 +10,13 @@ import 'package:gal/gal.dart';
 
 import 'calibration.dart';
 import 'exposure.dart';
+import 'film_format.dart';
 import 'film_frame.dart';
 import 'flash.dart';
 import 'flash_scale.dart';
 import 'lens_info.dart';
 import 'metering.dart';
 import 'number_input_dialog.dart';
-import 'six_by_six.dart';
 import 'units.dart';
 import 'wheel_dial.dart';
 
@@ -152,7 +152,6 @@ class _LightMeterPageState extends State<LightMeterPage>
 
   double _minZoom = 1.0;
   double _maxZoom = 1.0;
-  double _currentZoom = 1.0;
 
   CalcMode _calcMode = CalcMode.shutter;
   int _iso = 400;
@@ -166,9 +165,9 @@ class _LightMeterPageState extends State<LightMeterPage>
   double _distance = 3.0;
   bool _useFeet = false;
 
-  /// 6×6 focal-length viewfinder simulation.
-  bool _sixBySixEnabled = false;
-  double _simFocalMm = SixBySix.defaultFocalMm;
+  /// Focal-length viewfinder simulation (defaults to 6×6).
+  FilmFormat? _simFormat = FilmFormat.sixBySix;
+  double _simFocalMm = FilmFormat.sixBySix.defaultFocalMm;
   LensInfo? _lensInfo;
 
   final GlobalKey _previewKey = GlobalKey();
@@ -218,7 +217,7 @@ class _LightMeterPageState extends State<LightMeterPage>
   Future<void> _startCamera() async {
     _controller = CameraController(
       widget.camera,
-      ResolutionPreset.medium,
+      ResolutionPreset.max,
       enableAudio: false,
       imageFormatGroup: defaultTargetPlatform == TargetPlatform.iOS
           ? ImageFormatGroup.bgra8888
@@ -229,7 +228,11 @@ class _LightMeterPageState extends State<LightMeterPage>
       await _controller!.initialize();
       _minZoom = await _controller!.getMinZoomLevel();
       _maxZoom = await _controller!.getMaxZoomLevel();
-      _currentZoom = _minZoom;
+      // Keep optical zoom at its native wide end — framing is done by the
+      // format / focal simulation instead.
+      if (_maxZoom > _minZoom) {
+        await _controller!.setZoomLevel(_minZoom);
+      }
       await _controller!.startImageStream(_onFrame);
       await _loadLensInfo();
       if (!mounted) return;
@@ -334,18 +337,21 @@ class _LightMeterPageState extends State<LightMeterPage>
     return parseExposureParams(tags);
   }
 
-  /// Centre-crop fraction for the current 6×6 simulation, or null when off.
-  double? get _sixBySixCrop {
-    if (!_sixBySixEnabled) return null;
+  /// Centre-crop fraction for the current format simulation, or null when off.
+  double? get _simCrop {
+    final format = _simFormat;
+    if (format == null) return null;
     final lens = _lensInfo;
     if (lens == null || !lens.isUsable) return 1.0;
-    return lens.cropForSixBySix(_simFocalMm, _currentZoom);
+    return lens.cropForFormat(format, _simFocalMm, 1.0);
   }
 
-  bool get _sixBySixLimited {
-    final crop = _sixBySixCrop;
-    return _sixBySixEnabled && crop != null && crop >= 0.999;
+  bool get _simLimited {
+    final crop = _simCrop;
+    return _simFormat != null && crop != null && crop >= 0.999;
   }
+
+  bool get _simEnabled => _simFormat != null;
 
   /// Takes a still, stopping the analysis stream when the platform requires it.
   Future<Uint8List> _captureStillBytes(CameraController ctrl) async {
@@ -412,7 +418,8 @@ class _LightMeterPageState extends State<LightMeterPage>
       final stamped = await stampFilmFrame(
         jpegBytes: jpeg,
         caption: _filmCaption(),
-        cropFraction: _sixBySixCrop,
+        cropFraction: _simCrop,
+        cropAspectRatio: _simFormat?.aspectRatio ?? 1.0,
       );
 
       final name =
@@ -451,8 +458,10 @@ class _LightMeterPageState extends State<LightMeterPage>
             : 'Flash ${FlashMath.formatPower(power)}',
       );
     }
-    if (_sixBySixEnabled) {
-      extras.add('6×6 ${SixBySix.formatFocal(_simFocalMm)}');
+    if (_simFormat != null) {
+      extras.add(
+        '${_simFormat!.label} ${FilmOptics.formatFocal(_simFocalMm)}',
+      );
     }
 
     return FilmFrameCaption(
@@ -536,10 +545,10 @@ class _LightMeterPageState extends State<LightMeterPage>
       if (previewSize == null) return;
 
       var spot = _meterPoint;
-      final crop = _sixBySixCrop;
+      final crop = _simCrop;
       if (crop != null && crop < 1.0) {
         final mapped =
-            SixBySix.mapViewfinderToPreview(spot.dx, spot.dy, crop);
+            FilmOptics.mapViewfinderToPreview(spot.dx, spot.dy, crop);
         spot = Offset(mapped.x, mapped.y);
       }
 
@@ -610,9 +619,11 @@ class _LightMeterPageState extends State<LightMeterPage>
     _measure();
   }
 
-  Future<void> _onZoomChanged(double value) async {
-    setState(() => _currentZoom = value);
-    await _controller?.setZoomLevel(value);
+  Future<void> _onFocalSliderChanged(double index) async {
+    final lenses = _simFormat?.standardLensesMm;
+    if (lenses == null || lenses.isEmpty) return;
+    final i = index.round().clamp(0, lenses.length - 1);
+    setState(() => _simFocalMm = lenses[i]);
   }
 
   // -------------------------------------------------------------- calculator
@@ -874,120 +885,142 @@ class _LightMeterPageState extends State<LightMeterPage>
   Widget _buildPreview(CameraController ctrl) {
     return Row(
       children: [
-        if (_maxZoom > _minZoom) _buildZoomSlider(),
+        if (_simEnabled) _buildFocalSlider(),
         Expanded(
           child: Column(
             children: [
-              if (_sixBySixEnabled) _buildFocalBar(),
+              _buildFormatBar(),
               Expanded(
                 child: LayoutBuilder(
                   builder: (ctx, constraints) {
-                    final crop = _sixBySixCrop ?? 1.0;
-                    final side = min(constraints.maxWidth, constraints.maxHeight);
-                    // Square viewfinder when simulating 6×6; otherwise full area.
-                    final viewW = _sixBySixEnabled ? side : constraints.maxWidth;
-                    final viewH = _sixBySixEnabled ? side : constraints.maxHeight;
-                    _previewSize = Size(viewW, viewH);
+                    const controlsHeight = 56.0;
+                    final crop = _simCrop ?? 1.0;
+                    final format = _simFormat;
+                    final frameMaxW = constraints.maxWidth;
+                    final frameMaxH = max(
+                      0.0,
+                      constraints.maxHeight - controlsHeight,
+                    );
+                    final Size viewSize;
+                    if (format != null) {
+                      final fitted = FilmOptics.fitAspect(
+                        maxWidth: frameMaxW,
+                        maxHeight: frameMaxH,
+                        aspect: format.aspectRatio,
+                      );
+                      viewSize = Size(fitted.width, fitted.height);
+                    } else {
+                      viewSize = Size(frameMaxW, frameMaxH);
+                    }
+                    _previewSize = viewSize;
 
-                    return Center(
-                      child: SizedBox(
-                        key: _previewKey,
-                        width: viewW,
-                        height: viewH,
-                        child: GestureDetector(
-                          onTapUp: _onTapUp,
-                          child: Stack(
-                            fit: StackFit.expand,
+                    return Stack(
+                      fit: StackFit.expand,
+                      children: [
+                        // Format viewfinder — centred in the area above controls.
+                        Positioned(
+                          left: 0,
+                          right: 0,
+                          top: 0,
+                          bottom: controlsHeight,
+                          child: Center(
+                            child: SizedBox(
+                              key: _previewKey,
+                              width: viewSize.width,
+                              height: viewSize.height,
+                              child: GestureDetector(
+                                onTapUp: _onTapUp,
+                                child: Stack(
+                                  fit: StackFit.expand,
+                                  children: [
+                                    ClipRect(
+                                      child: Transform.scale(
+                                        scale:
+                                            _simEnabled ? (1.0 / crop) : 1.0,
+                                        child: OverflowBox(
+                                          alignment: Alignment.center,
+                                          child: FittedBox(
+                                            fit: BoxFit.cover,
+                                            child: SizedBox(
+                                              width: ctrl.value.previewSize
+                                                      ?.height ??
+                                                  viewSize.width,
+                                              height: ctrl.value.previewSize
+                                                      ?.width ??
+                                                  viewSize.height,
+                                              child: CameraPreview(ctrl),
+                                            ),
+                                          ),
+                                        ),
+                                      ),
+                                    ),
+                                    if (_simEnabled)
+                                      IgnorePointer(
+                                        child: CustomPaint(
+                                          painter: _FilmFramePainter(
+                                            color: _accent,
+                                            showThirds: true,
+                                          ),
+                                        ),
+                                      ),
+                                    CustomPaint(
+                                      painter: _SpotPainter(
+                                        point: _meterPoint,
+                                        radius: _spotRadius,
+                                        color: _accent,
+                                      ),
+                                    ),
+                                    if (_simEnabled)
+                                      Positioned(
+                                        top: 10,
+                                        right: 10,
+                                        child: _chip(
+                                          FilmOptics.formatFocal(_simFocalMm),
+                                        ),
+                                      ),
+                                    Positioned(
+                                      top: 10,
+                                      left: 10,
+                                      child: Column(
+                                        crossAxisAlignment:
+                                            CrossAxisAlignment.start,
+                                        children: [
+                                          _statusChip(),
+                                          if (_simEnabled &&
+                                              _lensInfo != null) ...[
+                                            const SizedBox(height: 6),
+                                            _chip(
+                                              'Lens ${_lensInfo!.focalLengthMm.toStringAsFixed(1)} mm',
+                                            ),
+                                          ],
+                                          if (_simLimited) ...[
+                                            const SizedBox(height: 6),
+                                            _chip('At phone FOV limit'),
+                                          ],
+                                        ],
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                        // Shutter / meter — locked to the video box bottom.
+                        Positioned(
+                          left: 12,
+                          right: 12,
+                          bottom: 8,
+                          height: controlsHeight - 8,
+                          child: Row(
+                            crossAxisAlignment: CrossAxisAlignment.center,
                             children: [
-                              ClipRect(
-                                child: Transform.scale(
-                                  scale: _sixBySixEnabled ? (1.0 / crop) : 1.0,
-                                  child: OverflowBox(
-                                    alignment: Alignment.center,
-                                    child: FittedBox(
-                                      fit: BoxFit.cover,
-                                      child: SizedBox(
-                                        width: ctrl.value.previewSize?.height ??
-                                            viewW,
-                                        height: ctrl.value.previewSize?.width ??
-                                            viewH,
-                                        child: CameraPreview(ctrl),
-                                      ),
-                                    ),
-                                  ),
-                                ),
-                              ),
-                              if (_sixBySixEnabled)
-                                IgnorePointer(
-                                  child: CustomPaint(
-                                    painter: _SixBySixFramePainter(
-                                      color: _accent,
-                                    ),
-                                  ),
-                                ),
-                              CustomPaint(
-                                painter: _SpotPainter(
-                                  point: _meterPoint,
-                                  radius: _spotRadius,
-                                  color: _accent,
-                                ),
-                              ),
-                              Positioned(
-                                top: 12,
-                                right: 12,
-                                child: Column(
-                                  crossAxisAlignment: CrossAxisAlignment.end,
-                                  children: [
-                                    _chip('${_currentZoom.toStringAsFixed(1)}×'),
-                                    if (_sixBySixEnabled) ...[
-                                      const SizedBox(height: 6),
-                                      _chip(SixBySix.formatFocal(_simFocalMm)),
-                                    ],
-                                  ],
-                                ),
-                              ),
-                              Positioned(
-                                top: 12,
-                                left: 12,
-                                child: Column(
-                                  crossAxisAlignment: CrossAxisAlignment.start,
-                                  children: [
-                                    _statusChip(),
-                                    const SizedBox(height: 6),
-                                    _sixBySixToggle(),
-                                    if (_sixBySixEnabled &&
-                                        _lensInfo != null) ...[
-                                      const SizedBox(height: 6),
-                                      _chip(
-                                        'Lens ${_lensInfo!.focalLengthMm.toStringAsFixed(1)} mm',
-                                      ),
-                                    ],
-                                    if (_sixBySixLimited) ...[
-                                      const SizedBox(height: 6),
-                                      _chip('At phone FOV limit'),
-                                    ],
-                                  ],
-                                ),
-                              ),
-                              Positioned(
-                                bottom: 12,
-                                right: 12,
-                                child: _meterButton(),
-                              ),
-                              Positioned(
-                                bottom: 12,
-                                left: 0,
-                                right: 0,
-                                child: Center(child: _shutterButton()),
-                              ),
-                              const Positioned(
-                                left: 12,
-                                bottom: 78,
+                              const Expanded(
                                 child: Text(
-                                  'Tap a point to meter it',
+                                  'Tap to meter',
                                   style: TextStyle(
-                                    color: Colors.white60,
-                                    fontSize: 12,
+                                    color: Colors.white54,
+                                    fontSize: 11,
                                     shadows: [
                                       Shadow(
                                         blurRadius: 4,
@@ -997,10 +1030,13 @@ class _LightMeterPageState extends State<LightMeterPage>
                                   ),
                                 ),
                               ),
+                              _shutterButton(),
+                              const SizedBox(width: 10),
+                              _meterButton(),
                             ],
                           ),
                         ),
-                      ),
+                      ],
                     );
                   },
                 ),
@@ -1012,77 +1048,171 @@ class _LightMeterPageState extends State<LightMeterPage>
     );
   }
 
-  Widget _sixBySixToggle() {
+  Widget _buildFormatBar() {
+    return Container(
+      height: 44,
+      color: const Color(0xFF0F0F0F),
+      child: ListView(
+        scrollDirection: Axis.horizontal,
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+        children: [
+          _formatChip(null, 'Off'),
+          const SizedBox(width: 8),
+          for (final format in FilmFormat.all) ...[
+            _formatChip(format, format.label),
+            const SizedBox(width: 8),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _formatChip(FilmFormat? format, String label) {
+    final selected = _simFormat == format;
     return GestureDetector(
       onTap: () {
         setState(() {
-          _sixBySixEnabled = !_sixBySixEnabled;
-          // Reset the spot to centre when entering the square finder.
-          if (_sixBySixEnabled) {
-            _meterPoint = const Offset(0.5, 0.5);
+          if (format == null) {
+            _simFormat = null;
+          } else {
+            final switching = _simFormat != format;
+            _simFormat = format;
+            if (switching) {
+              _simFocalMm = format.defaultFocalMm;
+              _meterPoint = const Offset(0.5, 0.5);
+            }
           }
         });
       },
       child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+        padding: const EdgeInsets.symmetric(horizontal: 12),
+        alignment: Alignment.center,
         decoration: BoxDecoration(
-          color: _sixBySixEnabled
-              ? _accent.withValues(alpha: 0.9)
-              : Colors.black54,
-          borderRadius: BorderRadius.circular(10),
+          color:
+              selected ? _accent.withValues(alpha: 0.9) : const Color(0xFF1A1A1A),
+          borderRadius: BorderRadius.circular(8),
           border: Border.all(
-            color: _sixBySixEnabled ? _accent : Colors.white24,
+            color: selected ? _accent : Colors.white12,
           ),
         ),
         child: Text(
-          '6×6',
+          label,
           style: TextStyle(
-            color: _sixBySixEnabled ? Colors.black : Colors.white,
+            color: selected ? Colors.black : Colors.white70,
+            fontWeight: selected ? FontWeight.w800 : FontWeight.w500,
             fontSize: 13,
-            fontWeight: FontWeight.w700,
           ),
         ),
       ),
     );
   }
 
-  Widget _buildFocalBar() {
+  /// Vertical focal-length dial: one stop per typical lens, longest at the top.
+  Widget _buildFocalSlider() {
+    final lenses = _simFormat!.standardLensesMm;
+    final last = lenses.length - 1;
+    var index = lenses.indexWhere((m) => (m - _simFocalMm).abs() < 0.01);
+    if (index < 0) index = lenses.indexOf(_simFormat!.defaultFocalMm);
+    if (index < 0) index = 0;
+
+    // Slider runs wide (0) → tele (last); rotated so tele sits at the top.
     return Container(
-      height: 52,
+      width: 64,
       color: const Color(0xFF0F0F0F),
-      child: ListView.separated(
-        scrollDirection: Axis.horizontal,
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-        itemCount: SixBySix.standardLensesMm.length,
-        separatorBuilder: (_, _) => const SizedBox(width: 8),
-        itemBuilder: (context, i) {
-          final mm = SixBySix.standardLensesMm[i];
-          final selected = (mm - _simFocalMm).abs() < 0.01;
-          return GestureDetector(
-            onTap: () => setState(() => _simFocalMm = mm),
-            child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 12),
-              alignment: Alignment.center,
-              decoration: BoxDecoration(
-                color: selected
-                    ? _accent.withValues(alpha: 0.2)
-                    : const Color(0xFF1A1A1A),
-                borderRadius: BorderRadius.circular(8),
-                border: Border.all(
-                  color: selected ? _accent : Colors.white12,
-                ),
-              ),
-              child: Text(
-                '${mm.round()}',
-                style: TextStyle(
-                  color: selected ? _accent : Colors.white70,
-                  fontWeight: selected ? FontWeight.w800 : FontWeight.w500,
-                  fontSize: 14,
-                ),
-              ),
+      padding: const EdgeInsets.symmetric(vertical: 12),
+      child: Column(
+        children: [
+          Text(
+            '${lenses.last.round()}',
+            style: const TextStyle(
+              fontSize: 11,
+              color: Colors.white54,
+              fontWeight: FontWeight.w600,
             ),
-          );
-        },
+          ),
+          const Text(
+            'mm',
+            style: TextStyle(fontSize: 9, color: Colors.white30),
+          ),
+          const SizedBox(height: 4),
+          Expanded(
+            child: Stack(
+              alignment: Alignment.center,
+              children: [
+                // Segment tick marks behind the track.
+                Positioned.fill(
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 10),
+                    child: CustomPaint(
+                      painter: _FocalTicksPainter(
+                        count: lenses.length,
+                        color: Colors.white24,
+                      ),
+                    ),
+                  ),
+                ),
+                RotatedBox(
+                  quarterTurns: -1,
+                  child: SliderTheme(
+                    data: SliderTheme.of(context).copyWith(
+                      trackHeight: 3,
+                      activeTrackColor: _accent,
+                      inactiveTrackColor: Colors.white12,
+                      thumbColor: _accent,
+                      overlayColor: _accent.withValues(alpha: 0.2),
+                      activeTickMarkColor: _accent,
+                      inactiveTickMarkColor: Colors.white38,
+                      tickMarkShape: const RoundSliderTickMarkShape(
+                        tickMarkRadius: 2.5,
+                      ),
+                      thumbShape: const RoundSliderThumbShape(
+                        enabledThumbRadius: 8,
+                      ),
+                      overlayShape: const RoundSliderOverlayShape(
+                        overlayRadius: 16,
+                      ),
+                    ),
+                    child: Slider(
+                      value: index.toDouble().clamp(0, last.toDouble()),
+                      min: 0,
+                      max: last.toDouble(),
+                      divisions: last,
+                      label: '${lenses[index].round()} mm',
+                      onChanged: _onFocalSliderChanged,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 4),
+          Text(
+            '${lenses.first.round()}',
+            style: const TextStyle(
+              fontSize: 11,
+              color: Colors.white54,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+          const Text(
+            'mm',
+            style: TextStyle(fontSize: 9, color: Colors.white30),
+          ),
+          const SizedBox(height: 8),
+          Text(
+            '${_simFocalMm.round()}',
+            style: const TextStyle(
+              fontSize: 18,
+              fontWeight: FontWeight.w800,
+              color: _accent,
+              height: 1.0,
+            ),
+          ),
+          const Text(
+            'mm',
+            style: TextStyle(fontSize: 10, color: _accent),
+          ),
+        ],
       ),
     );
   }
@@ -1095,20 +1225,20 @@ class _LightMeterPageState extends State<LightMeterPage>
         opacity: busy ? 0.45 : 1,
         duration: const Duration(milliseconds: 150),
         child: Container(
-          width: 68,
-          height: 68,
+          width: 44,
+          height: 44,
           decoration: BoxDecoration(
             shape: BoxShape.circle,
-            border: Border.all(color: Colors.white, width: 3),
+            border: Border.all(color: Colors.white, width: 2),
             boxShadow: const [
               BoxShadow(
                 color: Colors.black54,
-                blurRadius: 8,
-                offset: Offset(0, 2),
+                blurRadius: 6,
+                offset: Offset(0, 1),
               ),
             ],
           ),
-          padding: const EdgeInsets.all(4),
+          padding: const EdgeInsets.all(3),
           child: Container(
             decoration: BoxDecoration(
               shape: BoxShape.circle,
@@ -1116,9 +1246,9 @@ class _LightMeterPageState extends State<LightMeterPage>
             ),
             child: _saving
                 ? const Padding(
-                    padding: EdgeInsets.all(16),
+                    padding: EdgeInsets.all(8),
                     child: CircularProgressIndicator(
-                      strokeWidth: 2.5,
+                      strokeWidth: 2,
                       color: Colors.black,
                     ),
                   )
@@ -1135,19 +1265,25 @@ class _LightMeterPageState extends State<LightMeterPage>
       style: FilledButton.styleFrom(
         backgroundColor: _accent,
         foregroundColor: Colors.black,
-        padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 12),
+        visualDensity: VisualDensity.compact,
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+        minimumSize: const Size(0, 36),
+        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
       ),
       icon: _measuring
           ? const SizedBox(
-              width: 16,
-              height: 16,
+              width: 14,
+              height: 14,
               child: CircularProgressIndicator(
                 strokeWidth: 2,
                 color: Colors.black,
               ),
             )
-          : const Icon(Icons.center_focus_strong, size: 18),
-      label: Text(_measuring ? 'Metering' : 'Meter'),
+          : const Icon(Icons.center_focus_strong, size: 16),
+      label: Text(
+        _measuring ? 'Metering' : 'Meter',
+        style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
+      ),
     );
   }
 
@@ -1191,37 +1327,6 @@ class _LightMeterPageState extends State<LightMeterPage>
           fontSize: 14,
           fontWeight: FontWeight.w600,
         ),
-      ),
-    );
-  }
-
-  Widget _buildZoomSlider() {
-    return Container(
-      width: 44,
-      padding: const EdgeInsets.symmetric(vertical: 16),
-      color: const Color(0xFF0F0F0F),
-      child: Column(
-        children: [
-          Text(
-            '${_maxZoom.toStringAsFixed(0)}×',
-            style: const TextStyle(fontSize: 11, color: Colors.white54),
-          ),
-          const SizedBox(height: 6),
-          Expanded(
-            child: RotatedBox(
-              quarterTurns: -1,
-              child: Slider(
-                value: _currentZoom.clamp(_minZoom, _maxZoom),
-                min: _minZoom,
-                max: _maxZoom,
-                onChanged: _onZoomChanged,
-              ),
-            ),
-          ),
-          const SizedBox(height: 6),
-          const Text('1×',
-              style: TextStyle(fontSize: 11, color: Colors.white54)),
-        ],
       ),
     );
   }
@@ -1784,10 +1889,39 @@ class _CalcResult {
 
 /// Draws the metered patch: a ring the size of the area actually sampled,
 /// plus a broken crosshair for precise aim.
-class _SixBySixFramePainter extends CustomPainter {
+class _FocalTicksPainter extends CustomPainter {
+  final int count;
   final Color color;
 
-  _SixBySixFramePainter({required this.color});
+  _FocalTicksPainter({required this.count, required this.color});
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (count < 2) return;
+    final paint = Paint()
+      ..color = color
+      ..strokeWidth = 1;
+    for (var i = 0; i < count; i++) {
+      final t = i / (count - 1);
+      final y = t * size.height;
+      canvas.drawLine(
+        Offset(size.width * 0.35, y),
+        Offset(size.width * 0.65, y),
+        paint,
+      );
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _FocalTicksPainter old) =>
+      count != old.count || color != old.color;
+}
+
+class _FilmFramePainter extends CustomPainter {
+  final Color color;
+  final bool showThirds;
+
+  _FilmFramePainter({required this.color, this.showThirds = true});
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -1798,7 +1932,8 @@ class _SixBySixFramePainter extends CustomPainter {
       ..style = PaintingStyle.stroke;
     canvas.drawRect(rect.deflate(1), border);
 
-    // Light rule-of-thirds guides inside the square finder.
+    if (!showThirds) return;
+
     final guide = Paint()
       ..color = Colors.white24
       ..strokeWidth = 1;
@@ -1825,7 +1960,8 @@ class _SixBySixFramePainter extends CustomPainter {
   }
 
   @override
-  bool shouldRepaint(covariant _SixBySixFramePainter old) => color != old.color;
+  bool shouldRepaint(covariant _FilmFramePainter old) =>
+      color != old.color || showThirds != old.showThirds;
 }
 
 class _SpotPainter extends CustomPainter {

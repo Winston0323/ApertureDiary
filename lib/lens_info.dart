@@ -2,7 +2,7 @@ import 'package:exif/exif.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
-import 'six_by_six.dart';
+import 'film_format.dart';
 
 /// Physical lens / sensor info for the active camera.
 @immutable
@@ -24,38 +24,38 @@ class LensInfo {
   /// 35 mm-equivalent focal length, when the device or EXIF reports it.
   final double? equivalent35mm;
 
-  /// Shorter sensor side — the one that limits a square viewfinder.
-  double? get shortSensorSideMm {
-    final w = sensorWidthMm;
-    final h = sensorHeightMm;
-    if (w == null || h == null) return null;
-    return w < h ? w : h;
-  }
-
   bool get isUsable => focalLengthMm > 0;
 
-  /// Crop fraction for a 6×6 simulation at [simulatedFocalMm] and [zoom].
-  double cropForSixBySix(double simulatedFocalMm, double zoom) {
-    final short = shortSensorSideMm;
-    if (short != null) {
-      return SixBySix.cropFraction(
+  bool get hasSensorSize =>
+      sensorWidthMm != null &&
+      sensorHeightMm != null &&
+      sensorWidthMm! > 0 &&
+      sensorHeightMm! > 0;
+
+  /// Crop fraction for a focal simulation on [format] at [zoom].
+  double cropForFormat(FilmFormat format, double simulatedFocalMm, double zoom) {
+    if (hasSensorSize) {
+      return FilmOptics.cropFraction(
+        format: format,
         phoneFocalMm: focalLengthMm,
-        phoneSensorWidthMm: short,
+        phoneSensorWidthMm: sensorWidthMm!,
+        phoneSensorHeightMm: sensorHeightMm!,
         simulatedFocalMm: simulatedFocalMm,
         zoom: zoom,
       );
     }
     final eq = equivalent35mm;
     if (eq != null && eq > 0) {
-      return SixBySix.cropFractionFrom35mm(
+      return FilmOptics.cropFractionFrom35mm(
+        format: format,
         phone35mmEquivalent: eq,
         simulatedFocalMm: simulatedFocalMm,
         zoom: zoom,
       );
     }
-    // Last resort: treat the reported focal as already 35 mm-equivalent
-    // (common on phones that only expose that number).
-    return SixBySix.cropFractionFrom35mm(
+    // Last resort: treat the reported focal as already 35 mm-equivalent.
+    return FilmOptics.cropFractionFrom35mm(
+      format: format,
       phone35mmEquivalent: focalLengthMm,
       simulatedFocalMm: simulatedFocalMm,
       zoom: zoom,
@@ -68,7 +68,7 @@ class LensInfo {
     if (equivalent35mm != null) {
       bits.add('≈ ${equivalent35mm!.round()} mm eq');
     }
-    if (sensorWidthMm != null && sensorHeightMm != null) {
+    if (hasSensorSize) {
       bits.add(
         'sensor ${sensorWidthMm!.toStringAsFixed(2)}×'
         '${sensorHeightMm!.toStringAsFixed(2)} mm',
@@ -98,7 +98,6 @@ Future<LensInfo?> readLensInfoFromPlatform({String? cameraName}) async {
           .where((e) => e > 0)
           .toList();
       if (values.isNotEmpty) {
-        // Prefer the widest (shortest) native focal — that's the unzoomed view.
         values.sort();
         focal = values.first;
       }
@@ -142,7 +141,6 @@ LensInfo? parseLensInfoFromExif(Map<String, IfdTag> tags) {
 }
 
 double? _tagNumber(Map<String, IfdTag> tags, List<String> keys) {
-  // Reuse the same printable/ratio parsing as exposure tags.
   for (final key in keys) {
     final tag = tags[key];
     if (tag == null) continue;
