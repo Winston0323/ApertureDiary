@@ -132,7 +132,7 @@ Future<Uint8List> stampFilmFrame({
 
     final titlePainter = TextPainter(
       text: TextSpan(
-        text: 'LIGHT METER',
+        text: 'APERTUREDIARY',
         style: TextStyle(
           color: const Color(0xFFFFB300),
           fontSize: titleSize,

@@ -1,8 +1,8 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
-import 'package:light_meter/flash.dart';
-import 'package:light_meter/flash_scale.dart';
-import 'package:light_meter/units.dart';
+import 'package:aperture_diary/flash.dart';
+import 'package:aperture_diary/flash_scale.dart';
+import 'package:aperture_diary/units.dart';
 
 Future<void> pumpScale(
   WidgetTester tester, {

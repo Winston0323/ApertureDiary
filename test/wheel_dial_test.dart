@@ -1,6 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
-import 'package:light_meter/wheel_dial.dart';
+import 'package:aperture_diary/wheel_dial.dart';
 
 Future<void> pumpDial(WidgetTester tester, {int initialIndex = 3}) {
   return tester.pumpWidget(

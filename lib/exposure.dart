@@ -175,4 +175,8 @@ class ExposureMath {
   ];
 }
 
-enum CalcMode { shutter, aperture, flash }
+/// Which exposure factor the user last set by hand.
+///
+/// The opposite factor is what the calculator solves for: last-edited shutter
+/// means solve aperture, and last-edited aperture means solve shutter.
+enum LastEdited { shutter, aperture }

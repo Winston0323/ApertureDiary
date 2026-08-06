@@ -2,7 +2,7 @@ import 'dart:ui';
 
 import 'package:exif/exif.dart';
 import 'package:flutter_test/flutter_test.dart';
-import 'package:light_meter/metering.dart';
+import 'package:aperture_diary/metering.dart';
 
 /// 640×480 sensor frame shown in a 480×640 portrait preview.
 SpotMapping? mapPortrait(Offset spot, {int quarterTurns = 1}) {

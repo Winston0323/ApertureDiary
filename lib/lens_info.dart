@@ -78,7 +78,7 @@ class LensInfo {
   }
 }
 
-const _channel = MethodChannel('com.example.light_meter/lens');
+const _channel = MethodChannel('com.example.aperture_diary/lens');
 
 /// Reads lens info from the Android Camera2 characteristics.
 Future<LensInfo?> readLensInfoFromPlatform({String? cameraName}) async {

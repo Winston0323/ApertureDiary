@@ -1,5 +1,5 @@
 import 'package:flutter_test/flutter_test.dart';
-import 'package:light_meter/exposure.dart';
+import 'package:aperture_diary/exposure.dart';
 
 void main() {
   group('exposure solving', () {

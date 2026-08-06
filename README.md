@@ -1,4 +1,4 @@
-# Light Meter
+# ApertureDiary
 
 An Android spot light meter for film photography. Point the camera, tap the
 point you want to meter, and read off the shutter speed or aperture for the
@@ -46,13 +46,13 @@ With exposure locked, step 5 runs on every frame, so the reading tracks live as
 you move the phone. Once the patch clips or crushes the tone curve is no longer
 invertible, so the app re-meters automatically.
 
-## Flash mode
+## Flash calculator
 
-Guide number is defined as `GN = aperture × distance`, so flash power cannot be
-derived from GN, ISO, and aperture alone — the distance to the subject is the
-fourth term. Enter the guide number as the manufacturer rates it (ISO 100), the
-flash-to-subject distance, your film ISO, and your aperture; the app returns the
-power setting to dial in.
+Open **Flash** from the top bar. Guide number is defined as
+`GN = aperture × distance`, so flash power cannot be derived from GN, ISO, and
+aperture alone — the distance to the subject is the fourth term. Enter the guide
+number as the manufacturer rates it (ISO 100), the flash-to-subject distance,
+your film ISO, and your aperture; the app returns the power setting to dial in.
 
 Light output scales with power and sensitivity scales with the square root of
 ISO, so:
@@ -94,7 +94,7 @@ length on the border.
 
 The white shutter button on the preview captures the current frame, wraps it in
 a film-style border stamped with the shutter, aperture, and ISO from the
-calculator (plus EV when a reading exists), and saves it to a **Light Meter**
+calculator (plus EV when a reading exists), and saves it to an **ApertureDiary**
 album in the device gallery.
 
 - Readings are only as good as the phone's reported exposure metadata and its
@@ -113,8 +113,10 @@ album in the device gallery.
 | `lib/metering.dart` | EXIF exposure parsing, spot → sensor mapping, patch sampling |
 | `lib/film_format.dart` | Film formats + FOV / crop math |
 | `lib/lens_info.dart` | Android Camera2 / EXIF lens info |
+| `lib/flash.dart` | Guide-number flash math |
+| `lib/flash_page.dart` | Standalone flash calculator page |
 | `lib/flash_scale.dart` | Vertical power → distance axis |
 | `lib/units.dart` | Metre/foot conversion and number formatting |
 | `lib/number_input_dialog.dart` | Numeric entry dialog |
 | `lib/calibration.dart` | Persists the EV calibration offset |
-| `lib/main.dart` | Camera preview, metering flow, calculator UI |
+| `lib/main.dart` | Camera preview, metering flow, ambient calculator UI |

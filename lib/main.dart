@@ -12,12 +12,9 @@ import 'calibration.dart';
 import 'exposure.dart';
 import 'film_format.dart';
 import 'film_frame.dart';
-import 'flash.dart';
-import 'flash_scale.dart';
+import 'flash_page.dart';
 import 'lens_info.dart';
 import 'metering.dart';
-import 'number_input_dialog.dart';
-import 'units.dart';
 import 'wheel_dial.dart';
 
 Future<void> main() async {
@@ -41,7 +38,7 @@ Future<void> main() async {
     (c) => c.lensDirection == CameraLensDirection.back,
     orElse: () => cameras.first,
   );
-  runApp(LightMeterApp(camera: rear));
+  runApp(ApertureDiaryApp(camera: rear));
 }
 
 const Color _accent = Color(0xFFFFB300);
@@ -61,18 +58,6 @@ final ThemeData _darkTheme = ThemeData(
     activeTrackColor: _accent,
     thumbColor: _accent,
   ),
-  segmentedButtonTheme: SegmentedButtonThemeData(
-    style: ButtonStyle(
-      foregroundColor: WidgetStateProperty.resolveWith((states) {
-        if (states.contains(WidgetState.selected)) return Colors.black;
-        return Colors.white70;
-      }),
-      backgroundColor: WidgetStateProperty.resolveWith((states) {
-        if (states.contains(WidgetState.selected)) return _accent;
-        return const Color(0xFF1E1E1E);
-      }),
-    ),
-  ),
 );
 
 class _NoCameraApp extends StatelessWidget {
@@ -90,30 +75,30 @@ class _NoCameraApp extends StatelessWidget {
   }
 }
 
-class LightMeterApp extends StatelessWidget {
+class ApertureDiaryApp extends StatelessWidget {
   final CameraDescription camera;
-  const LightMeterApp({super.key, required this.camera});
+  const ApertureDiaryApp({super.key, required this.camera});
 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Light Meter',
+      title: 'ApertureDiary',
       debugShowCheckedModeBanner: false,
       theme: _darkTheme,
-      home: LightMeterPage(camera: camera),
+      home: ApertureDiaryPage(camera: camera),
     );
   }
 }
 
-class LightMeterPage extends StatefulWidget {
+class ApertureDiaryPage extends StatefulWidget {
   final CameraDescription camera;
-  const LightMeterPage({super.key, required this.camera});
+  const ApertureDiaryPage({super.key, required this.camera});
 
   @override
-  State<LightMeterPage> createState() => _LightMeterPageState();
+  State<ApertureDiaryPage> createState() => _ApertureDiaryPageState();
 }
 
-class _LightMeterPageState extends State<LightMeterPage>
+class _ApertureDiaryPageState extends State<ApertureDiaryPage>
     with WidgetsBindingObserver {
   CameraController? _controller;
   bool _isInitialized = false;
@@ -153,17 +138,11 @@ class _LightMeterPageState extends State<LightMeterPage>
   double _minZoom = 1.0;
   double _maxZoom = 1.0;
 
-  CalcMode _calcMode = CalcMode.shutter;
+  /// Last factor the user set by hand. The opposite is what we solve for.
+  LastEdited _lastEdited = LastEdited.aperture;
   int _iso = 400;
   double _aperture = 2.8;
   double _shutter = 1 / 125;
-
-  /// Guide number at ISO 100 and flash-to-subject distance, both in metres.
-  /// Stored metric and converted for display so the unit toggle cannot change
-  /// what was entered.
-  double _guideNumber = 36.0;
-  double _distance = 3.0;
-  bool _useFeet = false;
 
   /// Focal-length viewfinder simulation (defaults to 6×6).
   FilmFormat? _simFormat = FilmFormat.sixBySix;
@@ -423,12 +402,12 @@ class _LightMeterPageState extends State<LightMeterPage>
       );
 
       final name =
-          'light_meter_${DateTime.now().millisecondsSinceEpoch}';
-      await Gal.putImageBytes(stamped, name: name, album: 'Light Meter');
+          'aperture_diary_${DateTime.now().millisecondsSinceEpoch}';
+      await Gal.putImageBytes(stamped, name: name, album: 'ApertureDiary');
 
       if (!mounted) return;
       setState(() => _status = 'Saved to album');
-      _toast('Saved to Light Meter album');
+      _toast('Saved to ApertureDiary album');
     } on GalException catch (e) {
       if (mounted) {
         setState(() => _status = 'Save failed');
@@ -450,14 +429,6 @@ class _LightMeterPageState extends State<LightMeterPage>
     final aperture = _stampAperture();
     final ev = _ev;
     final extras = <String>[];
-    if (_calcMode == CalcMode.flash) {
-      final power = _recommendedPower;
-      extras.add(
-        power == null
-            ? 'Flash out of reach'
-            : 'Flash ${FlashMath.formatPower(power)}',
-      );
-    }
     if (_simFormat != null) {
       extras.add(
         '${_simFormat!.label} ${FilmOptics.formatFocal(_simFocalMm)}',
@@ -473,8 +444,12 @@ class _LightMeterPageState extends State<LightMeterPage>
     );
   }
 
+  bool get _solvingShutter => _lastEdited == LastEdited.aperture;
+
+  bool get _solvingAperture => _lastEdited == LastEdited.shutter;
+
   String _stampShutter() {
-    if (_calcMode == CalcMode.shutter) {
+    if (_solvingShutter) {
       final ev = _ev;
       if (ev != null) {
         final t = ExposureMath.shutterFromEv(
@@ -484,24 +459,12 @@ class _LightMeterPageState extends State<LightMeterPage>
         );
         return ExposureMath.formatShutter(ExposureMath.snapShutter(t));
       }
-    }
-    if (_calcMode == CalcMode.flash) {
-      final ev = _ev;
-      if (ev != null) {
-        final t = ExposureMath.shutterFromEv(
-          ev100: ev,
-          aperture: _aperture,
-          iso: _iso,
-        );
-        return ExposureMath.formatShutter(ExposureMath.snapShutter(t));
-      }
-      return 'flash';
     }
     return ExposureMath.formatShutter(_shutter);
   }
 
   String _stampAperture() {
-    if (_calcMode == CalcMode.aperture) {
+    if (_solvingAperture) {
       final ev = _ev;
       if (ev != null) {
         final n = ExposureMath.apertureFromEv(
@@ -628,159 +591,53 @@ class _LightMeterPageState extends State<LightMeterPage>
 
   // -------------------------------------------------------------- calculator
 
-  _CalcResult get _calcResult {
-    switch (_calcMode) {
-      case CalcMode.shutter:
-        return _shutterResult();
-      case CalcMode.aperture:
-        return _apertureResult();
-      case CalcMode.flash:
-        return _flashResult();
-    }
-  }
-
-  _CalcResult _shutterResult() {
+  String get _displayedShutter {
+    if (!_solvingShutter) return ExposureMath.formatShutter(_shutter);
     final ev = _ev;
-    if (ev == null) {
-      return const _CalcResult(
-        title: 'Suggested shutter',
-        value: '—',
-        detail: 'Meter a point first',
-      );
-    }
+    if (ev == null) return '—';
     final exact =
         ExposureMath.shutterFromEv(ev100: ev, aperture: _aperture, iso: _iso);
-    return _CalcResult(
-      title: 'Suggested shutter',
-      value: ExposureMath.formatShutter(ExposureMath.snapShutter(exact)),
-      detail: 'exact ${ExposureMath.formatShutter(exact)}  ·  '
-          '${ExposureMath.formatAperture(_aperture)}  ·  ISO $_iso',
-    );
+    return ExposureMath.formatShutter(ExposureMath.snapShutter(exact));
   }
 
-  _CalcResult _apertureResult() {
+  String get _displayedAperture {
+    if (!_solvingAperture) return ExposureMath.formatAperture(_aperture);
     final ev = _ev;
-    if (ev == null) {
-      return const _CalcResult(
-        title: 'Suggested aperture',
-        value: '—',
-        detail: 'Meter a point first',
-      );
+    if (ev == null) return '—';
+    final exact = ExposureMath.apertureFromEv(
+      ev100: ev,
+      shutterSeconds: _shutter,
+      iso: _iso,
+    );
+    return ExposureMath.formatAperture(ExposureMath.snapAperture(exact));
+  }
+
+  String? get _solveNote {
+    final ev = _ev;
+    if (ev == null) return 'Meter a point to solve the highlighted factor';
+    if (_solvingShutter) {
+      final exact =
+          ExposureMath.shutterFromEv(ev100: ev, aperture: _aperture, iso: _iso);
+      return 'exact ${ExposureMath.formatShutter(exact)}';
     }
     final exact = ExposureMath.apertureFromEv(
       ev100: ev,
       shutterSeconds: _shutter,
       iso: _iso,
     );
-    return _CalcResult(
-      title: 'Suggested aperture',
-      value: ExposureMath.formatAperture(ExposureMath.snapAperture(exact)),
-      detail: 'exact ${ExposureMath.formatAperture(exact)}  ·  '
-          '${ExposureMath.formatShutter(_shutter)}  ·  ISO $_iso',
-    );
+    return 'exact ${ExposureMath.formatAperture(exact)}';
   }
 
-  _CalcResult _flashResult() {
-    final exact = FlashMath.powerFraction(
-      guideNumberIso100: _guideNumber,
-      iso: _iso,
-      aperture: _aperture,
-      distance: _distance,
+  void _openFlash() {
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => FlashPage(
+          iso: _iso,
+          aperture: _aperture,
+          ambientEv: _ev,
+        ),
+      ),
     );
-    if (!exact.isFinite) {
-      return const _CalcResult(
-        title: 'Flash power',
-        value: '—',
-        detail: 'Enter a guide number and a distance',
-      );
-    }
-
-    final fullPowerReach = FlashMath.distanceAtPower(
-      guideNumberIso100: _guideNumber,
-      iso: _iso,
-      aperture: _aperture,
-      fraction: 1,
-    );
-    final workingGn = FlashMath.guideNumberAtIso(
-      guideNumberIso100: _guideNumber,
-      iso: _iso,
-    );
-    final reachNote = 'Full power reaches ${_formatLength(fullPowerReach)} at '
-        '${ExposureMath.formatAperture(_aperture)}  ·  '
-        'GN ${formatNumber(_convertLength(workingGn))} at ISO $_iso';
-
-    if (exact > 1) {
-      final short = FlashMath.stopsBeyondFullPower(exact);
-      final needed = FlashMath.apertureAtPower(
-        guideNumberIso100: _guideNumber,
-        iso: _iso,
-        distance: _distance,
-        fraction: 1,
-      );
-      return _CalcResult(
-        title: 'Flash power',
-        value: '1/1',
-        detail: reachNote,
-        warning: 'Out of reach by ${short.toStringAsFixed(1)} stops — open to '
-            '${ExposureMath.formatAperture(needed)}, move closer, or use '
-            'faster film',
-      );
-    }
-
-    final snapped = FlashMath.snapPower(exact);
-    final error = FlashMath.snapErrorStops(exact: exact, snapped: snapped);
-
-    String? warning;
-    if (exact < FlashMath.weakestPower) {
-      final weakestReach = FlashMath.distanceAtPower(
-        guideNumberIso100: _guideNumber,
-        iso: _iso,
-        aperture: _aperture,
-        fraction: FlashMath.weakestPower,
-      );
-      warning = 'Less light needed than 1/128 gives — stop down or move back '
-          'past ${_formatLength(weakestReach)}';
-    }
-
-    return _CalcResult(
-      title: 'Flash power',
-      value: FlashMath.formatPower(snapped),
-      detail: 'exact ${FlashMath.formatPowerPercent(exact)}  ·  '
-          'rounding ${ExposureMath.formatStops(error)}',
-      note: reachNote,
-      warning: warning,
-    );
-  }
-
-  /// Shutter that would expose the ambient light the same way, so you can see
-  /// whether the background will register alongside the flash.
-  String? get _ambientShutterNote {
-    final ev = _ev;
-    if (ev == null) return null;
-    final t =
-        ExposureMath.shutterFromEv(ev100: ev, aperture: _aperture, iso: _iso);
-    return 'Ambient alone needs '
-        '${ExposureMath.formatShutter(ExposureMath.snapShutter(t))} — stay at '
-        'or below your sync speed to keep it dark';
-  }
-
-  double _convertLength(double metres) =>
-      convertLength(metres, useFeet: _useFeet);
-
-  String _formatLength(double metres) =>
-      formatLength(metres, useFeet: _useFeet);
-
-  /// The setting the scale should mark, or null when the subject is out of
-  /// reach at full power.
-  double? get _recommendedPower {
-    final exact = FlashMath.powerFraction(
-      guideNumberIso100: _guideNumber,
-      iso: _iso,
-      aperture: _aperture,
-      distance: _distance,
-    );
-    if (!exact.isFinite || exact > 1) return null;
-    return FlashMath.snapPower(exact);
   }
 
   String _evToLabel(double ev) {
@@ -799,7 +656,25 @@ class _LightMeterPageState extends State<LightMeterPage>
   @override
   Widget build(BuildContext context) {
     return Scaffold(
+      backgroundColor: const Color(0xFF0A0A0A),
+      appBar: AppBar(
+        backgroundColor: const Color(0xFF0A0A0A),
+        foregroundColor: Colors.white,
+        elevation: 0,
+        title: const Text(
+          'ApertureDiary',
+          style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
+        ),
+        actions: [
+          IconButton(
+            tooltip: 'Flash',
+            icon: const Icon(Icons.flash_on),
+            onPressed: _isInitialized ? _openFlash : null,
+          ),
+        ],
+      ),
       body: SafeArea(
+        top: false,
         child: _isInitialized ? _buildContent() : _buildLoading(),
       ),
     );
@@ -853,9 +728,9 @@ class _LightMeterPageState extends State<LightMeterPage>
   }
 
   Widget _buildContent() {
-    // The on-screen keyboard shrinks the body, and flash mode adds a row, so
-    // the controls are allowed to scroll rather than overflow once they would
-    // squeeze the preview below a usable size.
+    // The on-screen keyboard shrinks the body, so the controls are allowed to
+    // scroll rather than overflow once they would squeeze the preview below a
+    // usable size.
     const minimumPreviewHeight = 140.0;
 
     return LayoutBuilder(
@@ -1458,6 +1333,7 @@ class _LightMeterPageState extends State<LightMeterPage>
   }
 
   Widget _buildExposurePanel() {
+    final note = _solveNote;
     return Container(
       width: double.infinity,
       padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
@@ -1465,17 +1341,6 @@ class _LightMeterPageState extends State<LightMeterPage>
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          SegmentedButton<CalcMode>(
-            showSelectedIcon: false,
-            segments: const [
-              ButtonSegment(value: CalcMode.shutter, label: Text('Shutter')),
-              ButtonSegment(value: CalcMode.aperture, label: Text('Aperture')),
-              ButtonSegment(value: CalcMode.flash, label: Text('Flash')),
-            ],
-            selected: {_calcMode},
-            onSelectionChanged: (s) => setState(() => _calcMode = s.first),
-          ),
-          const SizedBox(height: 10),
           Row(
             children: [
               Expanded(
@@ -1483,136 +1348,36 @@ class _LightMeterPageState extends State<LightMeterPage>
                   label: 'Film ISO',
                   value: '$_iso',
                   onTap: _pickIso,
-                  emphasize: true,
                 ),
               ),
               const SizedBox(width: 10),
               Expanded(
-                child: _calcMode == CalcMode.aperture
-                    ? _pickerTile(
-                        label: 'Shutter',
-                        value: ExposureMath.formatShutter(_shutter),
-                        onTap: _pickShutter,
-                        emphasize: true,
-                      )
-                    : _pickerTile(
-                        label: 'Aperture',
-                        value: ExposureMath.formatAperture(_aperture),
-                        onTap: _pickAperture,
-                        emphasize: true,
-                      ),
+                child: _pickerTile(
+                  label: 'Shutter',
+                  value: _displayedShutter,
+                  onTap: _pickShutter,
+                  emphasize: _solvingShutter,
+                ),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: _pickerTile(
+                  label: 'Aperture',
+                  value: _displayedAperture,
+                  onTap: _pickAperture,
+                  emphasize: _solvingAperture,
+                ),
               ),
             ],
           ),
-          if (_calcMode == CalcMode.flash) ...[
-            const SizedBox(height: 10),
-            Row(
-              children: [
-                Expanded(
-                  child: _pickerTile(
-                    label: 'Guide no. (ISO 100)',
-                    value: formatNumber(_convertLength(_guideNumber)),
-                    onTap: _promptGuideNumber,
-                    icon: Icons.edit_outlined,
-                  ),
-                ),
-                const SizedBox(width: 10),
-                Expanded(
-                  child: _pickerTile(
-                    label: 'Distance',
-                    value: _formatLength(_distance),
-                    onTap: _promptDistance,
-                    icon: Icons.edit_outlined,
-                  ),
-                ),
-                const SizedBox(width: 10),
-                SizedBox(
-                  width: 72,
-                  child: _pickerTile(
-                    label: 'Unit',
-                    value: _useFeet ? 'ft' : 'm',
-                    onTap: () => setState(() => _useFeet = !_useFeet),
-                    icon: Icons.swap_horiz,
-                  ),
-                ),
-              ],
+          if (note != null) ...[
+            const SizedBox(height: 8),
+            Text(
+              note,
+              textAlign: TextAlign.center,
+              style: const TextStyle(fontSize: 10.5, color: Colors.white38),
             ),
           ],
-          const SizedBox(height: 10),
-          _buildResultCard(_calcResult),
-          if (_calcMode == CalcMode.flash) ...[
-            const SizedBox(height: 12),
-            FlashRangeScale(
-              guideNumberIso100: _guideNumber,
-              iso: _iso,
-              aperture: _aperture,
-              useFeet: _useFeet,
-              highlightedPower: _recommendedPower,
-              subjectDistance: _distance,
-            ),
-          ],
-        ],
-      ),
-    );
-  }
-
-  Widget _buildResultCard(_CalcResult result) {
-    final ambient =
-        _calcMode == CalcMode.flash ? _ambientShutterNote : null;
-    const noteStyle = TextStyle(fontSize: 10.5, color: Colors.white38);
-
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-      decoration: BoxDecoration(
-        color: const Color(0xFF1A1A1A),
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: const Color(0x33FFB300)),
-      ),
-      child: Column(
-        children: [
-          Text(
-            result.title,
-            style: const TextStyle(fontSize: 12, color: Colors.white54),
-          ),
-          Text(
-            result.value,
-            style: const TextStyle(
-              fontSize: 34,
-              fontWeight: FontWeight.w700,
-              color: _accent,
-              letterSpacing: -0.5,
-              height: 1.1,
-            ),
-          ),
-          Text(result.detail, style: noteStyle, textAlign: TextAlign.center),
-          if (result.note != null)
-            Text(result.note!, style: noteStyle, textAlign: TextAlign.center),
-          if (ambient != null)
-            Text(ambient, style: noteStyle, textAlign: TextAlign.center),
-          if (result.warning != null)
-            Padding(
-              padding: const EdgeInsets.only(top: 6),
-              child: Row(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  const Icon(
-                    Icons.warning_amber_rounded,
-                    size: 14,
-                    color: Colors.orangeAccent,
-                  ),
-                  const SizedBox(width: 6),
-                  Expanded(
-                    child: Text(
-                      result.warning!,
-                      style: const TextStyle(
-                        fontSize: 10.5,
-                        color: Colors.orangeAccent,
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-            ),
         ],
       ),
     );
@@ -1629,7 +1394,7 @@ class _LightMeterPageState extends State<LightMeterPage>
       onTap: onTap,
       borderRadius: BorderRadius.circular(10),
       child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
         decoration: BoxDecoration(
           color: emphasize
               ? const Color(0xFF221C0A)
@@ -1648,10 +1413,12 @@ class _LightMeterPageState extends State<LightMeterPage>
               overflow: TextOverflow.ellipsis,
               style: TextStyle(
                 fontSize: 11,
-                color: emphasize ? _accent.withValues(alpha: 0.75) : Colors.white54,
+                color: emphasize
+                    ? _accent.withValues(alpha: 0.8)
+                    : Colors.white54,
               ),
             ),
-            const SizedBox(height: 2),
+            const SizedBox(height: 4),
             Row(
               children: [
                 Expanded(
@@ -1660,7 +1427,7 @@ class _LightMeterPageState extends State<LightMeterPage>
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                     style: TextStyle(
-                      fontSize: emphasize ? 22 : 19,
+                      fontSize: emphasize ? 20 : 18,
                       fontWeight: FontWeight.w700,
                       color: emphasize ? _accent : Colors.white,
                       letterSpacing: emphasize ? -0.4 : 0,
@@ -1669,7 +1436,9 @@ class _LightMeterPageState extends State<LightMeterPage>
                 ),
                 Icon(
                   icon,
-                  color: emphasize ? _accent.withValues(alpha: 0.7) : Colors.white38,
+                  color: emphasize
+                      ? _accent.withValues(alpha: 0.7)
+                      : Colors.white38,
                   size: 18,
                 ),
               ],
@@ -1678,55 +1447,6 @@ class _LightMeterPageState extends State<LightMeterPage>
         ),
       ),
     );
-  }
-
-  Future<void> _promptGuideNumber() async {
-    final entered = await _promptNumber(
-      title: 'Guide number',
-      helper: 'As rated at ISO 100, in ${_useFeet ? 'feet' : 'metres'}',
-      initial: _convertLength(_guideNumber),
-      lowest: 1,
-      highest: 300,
-    );
-    if (entered == null) return;
-    setState(() {
-      _guideNumber = toMetres(entered, useFeet: _useFeet);
-    });
-  }
-
-  Future<void> _promptDistance() async {
-    final entered = await _promptNumber(
-      title: 'Flash to subject',
-      helper: _useFeet ? 'In feet' : 'In metres',
-      initial: _convertLength(_distance),
-      lowest: 0.1,
-      highest: 300,
-    );
-    if (entered == null) return;
-    setState(() {
-      _distance = toMetres(entered, useFeet: _useFeet);
-    });
-  }
-
-  Future<double?> _promptNumber({
-    required String title,
-    required String helper,
-    required double initial,
-    required double lowest,
-    required double highest,
-  }) async {
-    final entered = await _whileModalOpen(
-      () => showDialog<double>(
-        context: context,
-        builder: (ctx) => NumberInputDialog(
-          title: title,
-          helper: helper,
-          initialText: formatNumber(initial),
-        ),
-      ),
-    );
-    if (entered == null || !entered.isFinite || entered <= 0) return null;
-    return entered.clamp(lowest, highest);
   }
 
   Future<void> _pickIso() async {
@@ -1746,7 +1466,12 @@ class _LightMeterPageState extends State<LightMeterPage>
       initial: _aperture,
       labelOf: ExposureMath.formatAperture,
     );
-    if (chosen != null) setState(() => _aperture = chosen);
+    if (chosen != null) {
+      setState(() {
+        _aperture = chosen;
+        _lastEdited = LastEdited.aperture;
+      });
+    }
   }
 
   Future<void> _pickShutter() async {
@@ -1756,7 +1481,12 @@ class _LightMeterPageState extends State<LightMeterPage>
       initial: _shutter,
       labelOf: ExposureMath.formatShutter,
     );
-    if (chosen != null) setState(() => _shutter = chosen);
+    if (chosen != null) {
+      setState(() {
+        _shutter = chosen;
+        _lastEdited = LastEdited.shutter;
+      });
+    }
   }
 
   Future<T?> _showWheelPicker<T>({
@@ -1867,24 +1597,6 @@ class _LightMeterPageState extends State<LightMeterPage>
       },
     );
   }
-}
-
-/// One computed answer for the calculator panel.
-@immutable
-class _CalcResult {
-  final String title;
-  final String value;
-  final String detail;
-  final String? note;
-  final String? warning;
-
-  const _CalcResult({
-    required this.title,
-    required this.value,
-    required this.detail,
-    this.note,
-    this.warning,
-  });
 }
 
 /// Draws the metered patch: a ring the size of the area actually sampled,

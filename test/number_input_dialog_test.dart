@@ -1,6 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
-import 'package:light_meter/number_input_dialog.dart';
+import 'package:aperture_diary/number_input_dialog.dart';
 
 /// Opens the dialog the way the app does and reports what it returned.
 Future<void> pumpHost(

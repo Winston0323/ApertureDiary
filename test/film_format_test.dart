@@ -1,5 +1,5 @@
 import 'package:flutter_test/flutter_test.dart';
-import 'package:light_meter/film_format.dart';
+import 'package:aperture_diary/film_format.dart';
 
 void main() {
   group('format geometry', () {

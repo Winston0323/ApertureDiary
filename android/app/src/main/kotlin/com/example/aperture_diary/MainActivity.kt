@@ -1,4 +1,4 @@
-package com.example.light_meter
+package com.example.aperture_diary
 
 import android.content.Context
 import android.hardware.camera2.CameraCharacteristics
@@ -11,7 +11,7 @@ import kotlin.math.atan
 import kotlin.math.tan
 
 class MainActivity : FlutterActivity() {
-    private val channelName = "com.example.light_meter/lens"
+    private val channelName = "com.example.aperture_diary/lens"
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)

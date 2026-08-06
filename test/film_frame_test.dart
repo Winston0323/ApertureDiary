@@ -3,7 +3,7 @@ import 'dart:ui';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:image/image.dart' as img;
-import 'package:light_meter/film_frame.dart';
+import 'package:aperture_diary/film_frame.dart';
 
 Uint8List tinyJpeg({int width = 64, int height = 48}) {
   final image = img.Image(width: width, height: height);
