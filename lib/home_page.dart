@@ -700,24 +700,29 @@ class _FilmPreviewThumb extends StatelessWidget {
   Widget build(BuildContext context) {
     const height = 56.0;
     final width = height * _aspect;
+    final scanPath = shot.scanImagePath;
+    final useScan = shot.hasScan &&
+        scanPath != null &&
+        File(scanPath).existsSync();
+    final path = useScan ? scanPath : shot.imagePath;
+
     return ClipRRect(
       borderRadius: BorderRadius.circular(6),
-      child: SizedBox(
+      child: Image.file(
+        File(path),
         width: width,
         height: height,
-        child: ColoredBox(
-          color: const Color(0xFF0F0F0F),
-          child: Image.file(
-            File(shot.imagePath),
-            fit: BoxFit.contain,
-            alignment: Alignment.center,
-            errorBuilder: (_, _, _) => const Center(
-              child: Icon(
-                Icons.broken_image_outlined,
-                color: Colors.white24,
-                size: 18,
-              ),
-            ),
+        fit: BoxFit.cover,
+        gaplessPlayback: true,
+        errorBuilder: (_, _, _) => Container(
+          width: width,
+          height: height,
+          color: const Color(0xFF2A2A2A),
+          alignment: Alignment.center,
+          child: const Icon(
+            Icons.broken_image_outlined,
+            color: Colors.white24,
+            size: 18,
           ),
         ),
       ),

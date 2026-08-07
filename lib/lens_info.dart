@@ -90,19 +90,20 @@ Future<LensInfo?> readLensInfoFromPlatform({String? cameraName}) async {
     );
     if (raw == null) return null;
 
-    final focals = raw['focalLengthsMm'];
-    double? focal;
-    if (focals is List && focals.isNotEmpty) {
-      final values = focals
-          .map((e) => (e as num).toDouble())
-          .where((e) => e > 0)
-          .toList();
-      if (values.isNotEmpty) {
-        values.sort();
-        focal = values.first;
+    // Prefer the platform-chosen primary wide focal; do not fall back to the
+    // shortest listed length (often the ultra-wide), which overstates FOV.
+    double? focal = (raw['focalLengthMm'] as num?)?.toDouble();
+    if (focal == null || focal <= 0) {
+      final focals = raw['focalLengthsMm'];
+      if (focals is List && focals.isNotEmpty) {
+        final values = focals
+            .map((e) => (e as num).toDouble())
+            .where((e) => e > 0)
+            .toList()
+          ..sort();
+        if (values.isNotEmpty) focal = values.first;
       }
     }
-    focal ??= (raw['focalLengthMm'] as num?)?.toDouble();
     if (focal == null || focal <= 0) return null;
 
     return LensInfo(

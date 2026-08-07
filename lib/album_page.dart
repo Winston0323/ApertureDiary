@@ -4,10 +4,13 @@ import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:gal/gal.dart';
+import 'package:image_picker/image_picker.dart';
 
 import 'album_shot.dart';
 import 'film_frame.dart';
 import 'film_stock.dart';
+import 'scan_pair_page.dart';
+import 'shot_thumb.dart';
 
 const Color _accent = Color(0xFFFFB300);
 
@@ -177,6 +180,41 @@ class _AlbumPageState extends State<AlbumPage> {
         duration: const Duration(seconds: 2),
       ),
     );
+  }
+
+  Future<void> _importScans() async {
+    if (_busy || widget.film == null || _shots.isEmpty) return;
+    setState(() => _busy = true);
+    try {
+      final picker = ImagePicker();
+      final picked = await picker.pickMultiImage(imageQuality: 95);
+      if (!mounted) return;
+      if (picked.isEmpty) return;
+
+      final files = <File>[];
+      for (final x in picked) {
+        files.add(File(x.path));
+      }
+
+      final oldestFirst = [..._shots]
+        ..sort((a, b) => a.takenAt.compareTo(b.takenAt));
+
+      final saved = await Navigator.of(context).push<bool>(
+        MaterialPageRoute(
+          builder: (_) => ScanPairPage(
+            shotsOldestFirst: oldestFirst,
+            scanFiles: files,
+          ),
+        ),
+      );
+      if (!mounted) return;
+      await _load();
+      if (saved == true) _toast('Scans paired');
+    } catch (e) {
+      if (mounted) _toast('Could not import: $e');
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
   }
 
   Future<void> _deleteSelected() async {
@@ -372,6 +410,12 @@ class _AlbumPageState extends State<AlbumPage> {
                     fontWeight: FontWeight.w800,
                   ),
                 ),
+              )
+            else if (widget.film != null && _shots.isNotEmpty)
+              IconButton(
+                tooltip: 'Import scans',
+                onPressed: _busy ? null : _importScans,
+                icon: const Icon(Icons.add_photo_alternate_outlined),
               ),
           ],
         ),
@@ -614,29 +658,33 @@ class _AlbumPageState extends State<AlbumPage> {
     return Padding(
       padding: const EdgeInsets.only(bottom: 10),
       child: Row(
-        crossAxisAlignment: CrossAxisAlignment.center,
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           SizedBox(
             width: 42,
-            child: _selectMode
-                ? Checkbox(
-                    value: selected,
-                    onChanged: _busy ? null : (_) => _toggleShotSelected(shot),
-                    activeColor: _accent,
-                    checkColor: Colors.black,
-                    side: const BorderSide(color: Colors.white38),
-                    materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                    visualDensity: VisualDensity.compact,
-                  )
-                : Text(
-                    _formatTime(shot.takenAt),
-                    style: const TextStyle(
-                      color: Colors.white54,
-                      fontSize: 11,
-                      fontWeight: FontWeight.w600,
-                      fontFeatures: [FontFeature.tabularFigures()],
+            child: Padding(
+              padding: const EdgeInsets.only(top: 14),
+              child: _selectMode
+                  ? Checkbox(
+                      value: selected,
+                      onChanged:
+                          _busy ? null : (_) => _toggleShotSelected(shot),
+                      activeColor: _accent,
+                      checkColor: Colors.black,
+                      side: const BorderSide(color: Colors.white38),
+                      materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                      visualDensity: VisualDensity.compact,
+                    )
+                  : Text(
+                      _formatTime(shot.takenAt),
+                      style: const TextStyle(
+                        color: Colors.white54,
+                        fontSize: 11,
+                        fontWeight: FontWeight.w600,
+                        fontFeatures: [FontFeature.tabularFigures()],
+                      ),
                     ),
-                  ),
+            ),
           ),
           const SizedBox(width: 8),
           Expanded(
@@ -651,81 +699,88 @@ class _AlbumPageState extends State<AlbumPage> {
                 onLongPress:
                     _busy || _selectMode ? null : () => _enterSelectMode(shot),
                 child: Padding(
-                  padding: const EdgeInsets.all(8),
-                  child: Row(
+                  padding: const EdgeInsets.all(10),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
                     children: [
-                      ClipRRect(
-                        borderRadius: BorderRadius.circular(8),
-                        child: Image.file(
-                          File(shot.imagePath),
-                          width: 64,
-                          height: 64,
-                          fit: BoxFit.cover,
-                          errorBuilder: (_, _, _) => Container(
-                            width: 64,
-                            height: 64,
-                            color: const Color(0xFF2A2A2A),
-                            child: const Icon(
-                              Icons.broken_image_outlined,
-                              color: Colors.white24,
-                              size: 22,
+                      ShotThumbStack(
+                        shot: shot,
+                        height: 100,
+                        borderRadius: 8,
+                      ),
+                      const SizedBox(height: 10),
+                      Row(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Row(
+                                  children: [
+                                    Expanded(
+                                      child: Text(
+                                        shot.filmName,
+                                        maxLines: 1,
+                                        overflow: TextOverflow.ellipsis,
+                                        style: const TextStyle(
+                                          color: Colors.white,
+                                          fontWeight: FontWeight.w600,
+                                          fontSize: 14,
+                                        ),
+                                      ),
+                                    ),
+                                    if (shot.hasScan) ...[
+                                      const SizedBox(width: 6),
+                                      const ScanChip(),
+                                    ],
+                                  ],
+                                ),
+                                const SizedBox(height: 3),
+                                Text(
+                                  '${shot.shutter}  ·  ${shot.aperture}'
+                                  '${shot.flash ? '  ·  Flash' : ''}',
+                                  style: const TextStyle(
+                                    color: Colors.white54,
+                                    fontSize: 12,
+                                  ),
+                                ),
+                                if (shot.formatLabel != null ||
+                                    _selectMode) ...[
+                                  const SizedBox(height: 2),
+                                  Text(
+                                    _selectMode
+                                        ? _formatTime(shot.takenAt)
+                                        : [
+                                            shot.formatLabel,
+                                            if (shot.focalMm != null)
+                                              '${shot.focalMm!.round()} mm',
+                                            'ISO ${shot.iso}',
+                                          ].join('  ·  '),
+                                    style: TextStyle(
+                                      color:
+                                          selected ? _accent : Colors.white38,
+                                      fontSize: 11,
+                                      fontWeight: _selectMode
+                                          ? FontWeight.w600
+                                          : FontWeight.w400,
+                                    ),
+                                  ),
+                                ],
+                              ],
                             ),
                           ),
-                        ),
-                      ),
-                      const SizedBox(width: 12),
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text(
-                              shot.filmName,
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: const TextStyle(
-                                color: Colors.white,
-                                fontWeight: FontWeight.w600,
-                                fontSize: 14,
+                          if (!_selectMode)
+                            const Padding(
+                              padding: EdgeInsets.only(left: 4, top: 2),
+                              child: Icon(
+                                Icons.chevron_right,
+                                color: Colors.white24,
+                                size: 20,
                               ),
                             ),
-                            const SizedBox(height: 3),
-                            Text(
-                              '${shot.shutter}  ·  ${shot.aperture}'
-                              '${shot.flash ? '  ·  Flash' : ''}',
-                              style: const TextStyle(
-                                color: Colors.white54,
-                                fontSize: 12,
-                              ),
-                            ),
-                            if (shot.formatLabel != null || _selectMode) ...[
-                              const SizedBox(height: 2),
-                              Text(
-                                _selectMode
-                                    ? _formatTime(shot.takenAt)
-                                    : [
-                                        shot.formatLabel,
-                                        if (shot.focalMm != null)
-                                          '${shot.focalMm!.round()} mm',
-                                        'ISO ${shot.iso}',
-                                      ].join('  ·  '),
-                                style: TextStyle(
-                                  color: selected ? _accent : Colors.white38,
-                                  fontSize: 11,
-                                  fontWeight: _selectMode
-                                      ? FontWeight.w600
-                                      : FontWeight.w400,
-                                ),
-                              ),
-                            ],
-                          ],
-                        ),
+                        ],
                       ),
-                      if (!_selectMode)
-                        const Icon(
-                          Icons.chevron_right,
-                          color: Colors.white24,
-                          size: 20,
-                        ),
                     ],
                   ),
                 ),
@@ -751,17 +806,93 @@ class AlbumDetailPage extends StatefulWidget {
 class _AlbumDetailPageState extends State<AlbumDetailPage> {
   late AlbumShot _shot;
   bool _exporting = false;
+  bool _scanBusy = false;
+  late bool _viewScan;
 
   @override
   void initState() {
     super.initState();
     _shot = widget.shot;
+    _viewScan = _shot.hasScan;
   }
 
   Future<void> _setFlash(bool value) async {
     final updated = _shot.copyWith(flash: value);
     setState(() => _shot = updated);
     await AlbumShotStore.update(updated);
+  }
+
+  Future<void> _addOrReplaceScan() async {
+    if (_scanBusy || _exporting) return;
+    setState(() => _scanBusy = true);
+    try {
+      final picker = ImagePicker();
+      final picked = await picker.pickImage(
+        source: ImageSource.gallery,
+        imageQuality: 95,
+      );
+      if (picked == null || !mounted) return;
+      final bytes = await File(picked.path).readAsBytes();
+      final updated = await AlbumShotStore.setScan(
+        shotId: _shot.id,
+        jpegBytes: bytes,
+      );
+      if (!mounted) return;
+      if (updated != null) {
+        final wasReplace = _shot.hasScan;
+        setState(() {
+          _shot = updated;
+          _viewScan = true;
+        });
+        _toast(wasReplace ? 'Scan updated' : 'Scan added');
+      }
+    } catch (e) {
+      if (mounted) _toast('Could not import scan: $e');
+    } finally {
+      if (mounted) setState(() => _scanBusy = false);
+    }
+  }
+
+  Future<void> _removeScan() async {
+    if (_scanBusy || _exporting || !_shot.hasScan) return;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF1A1A1A),
+        title: const Text('Remove scan'),
+        content: const Text('Detach the scanned image from this frame?'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text(
+              'Remove',
+              style: TextStyle(color: Colors.redAccent),
+            ),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+    setState(() => _scanBusy = true);
+    try {
+      final updated = await AlbumShotStore.clearScan(_shot.id);
+      if (!mounted) return;
+      if (updated != null) {
+        setState(() {
+          _shot = updated;
+          _viewScan = false;
+        });
+        _toast('Scan removed');
+      }
+    } catch (e) {
+      if (mounted) _toast('Could not remove scan: $e');
+    } finally {
+      if (mounted) setState(() => _scanBusy = false);
+    }
   }
 
   void _toast(String message) {
@@ -939,38 +1070,97 @@ class _AlbumDetailPageState extends State<AlbumDetailPage> {
           style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
         ),
         actions: [
-          IconButton(
-            tooltip: 'Delete',
-            onPressed: _exporting ? null : _delete,
-            icon: const Icon(Icons.delete_outline, color: Colors.redAccent),
+          PopupMenuButton<String>(
+            enabled: !_exporting && !_scanBusy,
+            color: const Color(0xFF1A1A1A),
+            onSelected: (value) async {
+              if (value == 'add_scan' || value == 'replace_scan') {
+                await _addOrReplaceScan();
+              } else if (value == 'remove_scan') {
+                await _removeScan();
+              } else if (value == 'delete') {
+                await _delete();
+              }
+            },
+            itemBuilder: (ctx) => [
+              PopupMenuItem(
+                value: _shot.hasScan ? 'replace_scan' : 'add_scan',
+                child: Text(_shot.hasScan ? 'Replace scan' : 'Add scan'),
+              ),
+              if (_shot.hasScan)
+                const PopupMenuItem(
+                  value: 'remove_scan',
+                  child: Text('Remove scan'),
+                ),
+              const PopupMenuDivider(),
+              const PopupMenuItem(
+                value: 'delete',
+                child: Text(
+                  'Delete frame',
+                  style: TextStyle(color: Colors.redAccent),
+                ),
+              ),
+            ],
           ),
         ],
       ),
       body: SafeArea(
         child: Column(
           children: [
-            Expanded(
-              child: Padding(
-                padding: const EdgeInsets.fromLTRB(12, 4, 12, 8),
-                child: ClipRRect(
-                  borderRadius: BorderRadius.circular(12),
-                  child: InteractiveViewer(
-                    minScale: 1,
-                    maxScale: 4,
-                    child: Image.file(
-                      File(_shot.imagePath),
-                      fit: BoxFit.contain,
-                      width: double.infinity,
-                      height: double.infinity,
-                      errorBuilder: (_, _, _) => const Center(
-                        child: Icon(
-                          Icons.broken_image_outlined,
-                          color: Colors.white24,
-                          size: 48,
-                        ),
+            if (_shot.hasScan)
+              Padding(
+                padding: const EdgeInsets.fromLTRB(12, 8, 12, 4),
+                child: SizedBox(
+                  width: double.infinity,
+                  child: SegmentedButton<bool>(
+                    showSelectedIcon: false,
+                    segments: const [
+                      ButtonSegment<bool>(
+                        value: false,
+                        label: Text('Meter'),
+                        icon: Icon(Icons.camera_outlined, size: 16),
+                      ),
+                      ButtonSegment<bool>(
+                        value: true,
+                        label: Text('Scan'),
+                        icon: Icon(Icons.photo_outlined, size: 16),
+                      ),
+                    ],
+                    selected: {_viewScan},
+                    onSelectionChanged: (next) {
+                      setState(() => _viewScan = next.first);
+                    },
+                    style: ButtonStyle(
+                      backgroundColor:
+                          WidgetStateProperty.resolveWith((states) {
+                        if (states.contains(WidgetState.selected)) {
+                          return _accent.withValues(alpha: 0.2);
+                        }
+                        return const Color(0xFF1A1A1A);
+                      }),
+                      foregroundColor:
+                          WidgetStateProperty.resolveWith((states) {
+                        if (states.contains(WidgetState.selected)) {
+                          return _accent;
+                        }
+                        return Colors.white70;
+                      }),
+                      side: WidgetStateProperty.all(
+                        const BorderSide(color: Colors.white12),
                       ),
                     ),
                   ),
+                ),
+              ),
+            Expanded(
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(12, 4, 12, 8),
+                child: _viewerImage(
+                  path: _viewScan &&
+                          _shot.hasScan &&
+                          _shot.scanImagePath != null
+                      ? _shot.scanImagePath!
+                      : _shot.imagePath,
                 ),
               ),
             ),
@@ -1001,6 +1191,7 @@ class _AlbumDetailPageState extends State<AlbumDetailPage> {
                         '${_shot.focalMm!.round()} mm',
                       if (_shot.ev != null)
                         'EV ${_shot.ev!.toStringAsFixed(1)}',
+                      if (_shot.hasScan) 'Scan',
                     ].join('  ·  '),
                     style: const TextStyle(color: Colors.white38, fontSize: 12),
                   ),
@@ -1024,7 +1215,7 @@ class _AlbumDetailPageState extends State<AlbumDetailPage> {
                   const SizedBox(height: 8),
                   CheckboxListTile(
                     value: _shot.flash,
-                    onChanged: _exporting
+                    onChanged: _exporting || _scanBusy
                         ? null
                         : (v) => _setFlash(v ?? false),
                     activeColor: _accent,
@@ -1039,7 +1230,9 @@ class _AlbumDetailPageState extends State<AlbumDetailPage> {
                   ),
                   const SizedBox(height: 8),
                   FilledButton.icon(
-                    onPressed: _exporting ? null : _openSaveToPhoneSheet,
+                    onPressed: _exporting || _scanBusy
+                        ? null
+                        : _openSaveToPhoneSheet,
                     style: FilledButton.styleFrom(
                       backgroundColor: _accent,
                       foregroundColor: Colors.black,
@@ -1065,6 +1258,33 @@ class _AlbumDetailPageState extends State<AlbumDetailPage> {
               ),
             ),
           ],
+        ),
+      ),
+    );
+  }
+
+  Widget _viewerImage({required String path}) {
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(12),
+      child: ColoredBox(
+        color: const Color(0xFF111111),
+        child: InteractiveViewer(
+          minScale: 1,
+          maxScale: 4,
+          child: Center(
+            child: Image.file(
+              File(path),
+              fit: BoxFit.contain,
+              gaplessPlayback: true,
+              errorBuilder: (_, _, _) => const Center(
+                child: Icon(
+                  Icons.broken_image_outlined,
+                  color: Colors.white24,
+                  size: 48,
+                ),
+              ),
+            ),
+          ),
         ),
       ),
     );

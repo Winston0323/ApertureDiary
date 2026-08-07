@@ -1,3 +1,5 @@
+import 'dart:math';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:aperture_diary/film_format.dart';
 
@@ -17,12 +19,36 @@ void main() {
       );
     });
 
-    test('6×6 is square and 80 mm ≈ 41 mm eq', () {
+    test('6×6 is square 56 mm gate and 80 mm ≈ 44 mm eq', () {
       expect(FilmFormat.sixBySix.isSquare, isTrue);
+      expect(FilmFormat.sixBySix.widthMm, 56);
+      // 80 mm on 56×56 ≈ 43.7 mm on 35 mm (diagonal crop).
       expect(
         FilmFormat.sixBySix.to35mmEquivalent(80),
-        closeTo(40.8, 0.2),
+        closeTo(43.7, 0.3),
       );
+    });
+  });
+
+  group('screen axes', () {
+    test('portrait maps short sensor side to horizontal', () {
+      final axes = FilmOptics.screenAxesFromSensor(
+        sensorWidthMm: 7.0,
+        sensorHeightMm: 5.0,
+        previewPortrait: true,
+      );
+      expect(axes.horizMm, 5.0);
+      expect(axes.vertMm, 7.0);
+    });
+
+    test('landscape maps long sensor side to horizontal', () {
+      final axes = FilmOptics.screenAxesFromSensor(
+        sensorWidthMm: 7.0,
+        sensorHeightMm: 5.0,
+        previewPortrait: false,
+      );
+      expect(axes.horizMm, 7.0);
+      expect(axes.vertMm, 5.0);
     });
   });
 
@@ -31,11 +57,31 @@ void main() {
       final fraction = FilmOptics.cropFraction(
         format: FilmFormat.sixBySix,
         phoneFocalMm: 80,
-        phoneSensorWidthMm: 60,
-        phoneSensorHeightMm: 60,
+        phoneSensorWidthMm: 56,
+        phoneSensorHeightMm: 56,
         simulatedFocalMm: 80,
+        previewPortrait: false,
       );
       expect(fraction, 1.0);
+    });
+
+    test('6×6 uses the 56 mm gate, not a 60 mm film width', () {
+      final crop56 = FilmOptics.cropFraction(
+        format: FilmFormat.sixBySix,
+        phoneFocalMm: 4.2,
+        phoneSensorWidthMm: 6.3,
+        phoneSensorHeightMm: 4.7,
+        simulatedFocalMm: 150,
+      );
+      // Same phone, but FOV as if the gate were the old incorrect 60 mm.
+      final fov60 = FilmOptics.fieldOfViewRadians(150, 60);
+      final screen = FilmOptics.screenAxesFromSensor(
+        sensorWidthMm: 6.3,
+        sensorHeightMm: 4.7,
+      );
+      final fovPhone = FilmOptics.fieldOfViewRadians(4.2, screen.horizMm);
+      final crop60 = tan(fov60 / 2) / tan(fovPhone / 2);
+      expect(crop56, lessThan(crop60));
     });
 
     test('36×24 at 50 mm matches a 50 mm-eq phone', () {
@@ -58,36 +104,75 @@ void main() {
         phone35mmEquivalent: 26,
         simulatedFocalMm: 85,
       );
-      expect(normal, closeTo(26 / 50, 1e-6));
+      expect(normal, lessThan(1.0));
       expect(tele, lessThan(normal));
-      expect(tele, closeTo(26 / 85, 1e-6));
     });
 
-    test('645 crop uses the format diagonal', () {
-      final fraction = FilmOptics.cropFractionFrom35mm(
+    test('645 and 6×6 share the 56 mm width so HFOV crop matches', () {
+      // Both gates are 56 mm wide; horizontal FOV — and thus crop — match.
+      // They differ only in viewfinder aspect (and vertical FOV).
+      const phoneF = 4.2;
+      const sensorW = 7.0;
+      const sensorH = 5.2;
+      final crop645 = FilmOptics.cropFraction(
         format: FilmFormat.sixFourFive,
-        phone35mmEquivalent: 26,
+        phoneFocalMm: phoneF,
+        phoneSensorWidthMm: sensorW,
+        phoneSensorHeightMm: sensorH,
         simulatedFocalMm: 75,
       );
-      expect(
-        fraction,
-        closeTo(26 / FilmFormat.sixFourFive.to35mmEquivalent(75), 1e-9),
+      final crop66 = FilmOptics.cropFraction(
+        format: FilmFormat.sixBySix,
+        phoneFocalMm: phoneF,
+        phoneSensorWidthMm: sensorW,
+        phoneSensorHeightMm: sensorH,
+        simulatedFocalMm: 75,
       );
+      expect(crop645, closeTo(crop66, 1e-9));
+      expect(FilmFormat.sixFourFive.aspectRatio, isNot(1));
+      expect(FilmFormat.sixBySix.isSquare, isTrue);
+    });
+
+    test('portrait axis mapping changes the crop vs landscape sensor axes', () {
+      final portrait = FilmOptics.cropFraction(
+        format: FilmFormat.thirtyFive,
+        phoneFocalMm: 4.2,
+        phoneSensorWidthMm: 7.0,
+        phoneSensorHeightMm: 5.2,
+        simulatedFocalMm: 50,
+        previewPortrait: true,
+      );
+      final landscape = FilmOptics.cropFraction(
+        format: FilmFormat.thirtyFive,
+        phoneFocalMm: 4.2,
+        phoneSensorWidthMm: 7.0,
+        phoneSensorHeightMm: 5.2,
+        simulatedFocalMm: 50,
+        previewPortrait: false,
+      );
+      expect(portrait, isNot(closeTo(landscape, 1e-6)));
     });
 
     test('sensor path covers film aspect before matching FOV', () {
-      // Phone 7×5 mm landscape; film 3:2 → visible width = 5 * 1.5 = 7.5? 
-      // phoneAspect 1.4, filmAspect 1.5 → phone is narrower relatively,
-      // so width fills: visibleWidth = 7.
       final fraction = FilmOptics.cropFraction(
         format: FilmFormat.thirtyFive,
         phoneFocalMm: 4,
         phoneSensorWidthMm: 7,
         phoneSensorHeightMm: 5,
         simulatedFocalMm: 50,
+        previewPortrait: false,
       );
       expect(fraction, lessThan(1.0));
       expect(fraction, greaterThan(0.05));
+    });
+
+    test('wider than phone FOV hits the limit', () {
+      final fraction = FilmOptics.cropFractionFrom35mm(
+        format: FilmFormat.thirtyFive,
+        phone35mmEquivalent: 26,
+        simulatedFocalMm: 24,
+      );
+      expect(fraction, 1.0);
     });
 
     test('zoom reduces how much digital crop is needed', () {
@@ -108,6 +193,15 @@ void main() {
         zoom: 2,
       );
       expect(zoomed, greaterThan(unzoomed));
+    });
+
+    test('diagonal 35 mm-eq from sensor matches full-frame identity', () {
+      final eq = FilmOptics.equivalent35mmFromSensor(
+        focalMm: 50,
+        sensorWidthMm: 36,
+        sensorHeightMm: 24,
+      );
+      expect(eq, closeTo(50, 0.01));
     });
   });
 

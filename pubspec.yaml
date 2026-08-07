@@ -37,6 +37,8 @@ dependencies:
   exif: ^3.3.0
   gal: ^2.3.3
   image: ^4.9.1
+  image_picker: ^1.1.2
+  animated_reorderable_list: ^1.3.0
 
 dev_dependencies:
   flutter_test:

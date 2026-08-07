@@ -171,12 +171,10 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
   double _aperture = 2.8;
   double _shutter = 1 / 125;
 
-  /// Focal-length viewfinder simulation, limited by the loaded film's roll size.
-  late FilmFormat _simFormat = widget.film.frameFormat;
+  /// Focal-length viewfinder simulation — format is locked by the loaded roll.
+  FilmFormat get _simFormat => widget.film.frameFormat;
   late double _simFocalMm = _simFormat.defaultFocalMm;
   LensInfo? _lensInfo;
-
-  List<FilmFormat> get _allowedFormats => widget.film.allowedFormats;
 
   final GlobalKey _previewKey = GlobalKey();
 
@@ -345,38 +343,14 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
     return parseExposureParams(tags);
   }
 
-  /// Format used for the viewfinder window / phone FOV crop.
-  ///
-  /// 645 is shown inside a 6×6 feed with an FOV gate overlay.
-  FilmFormat get _viewfinderFormat =>
-      _simFormat == FilmFormat.sixFourFive
-          ? FilmFormat.sixBySix
-          : _simFormat;
-
-  /// Centre-crop fraction for the current format simulation.
+  /// Centre-crop fraction for the current format + focal simulation.
   double get _simCrop {
     final lens = _lensInfo;
     if (lens == null || !lens.isUsable) return 1.0;
-    return lens.cropForFormat(_viewfinderFormat, _simFocalMm, 1.0);
+    return lens.cropForFormat(_simFormat, _simFocalMm, 1.0);
   }
 
   bool get _simLimited => _simCrop >= 0.999;
-
-  /// Physical gate of [_simFormat] inside [_viewfinderFormat], when nested.
-  ///
-  /// 645 uses the full 6×6 width with a shorter height (645 aspect), so the
-  /// orange FOV border matches the square feed width.
-  ({double width, double height})? get _fovGateFractions {
-    if (_simFormat == FilmFormat.sixFourFive &&
-        _viewfinderFormat == FilmFormat.sixBySix) {
-      return (
-        width: 1.0,
-        height: FilmFormat.sixFourFive.heightMm / FilmFormat.sixFourFive.widthMm,
-      );
-    }
-    if (_simFormat == _viewfinderFormat) return null;
-    return _simFormat.fractionsInside(_viewfinderFormat);
-  }
 
   /// Takes a still, pausing the preview analysis stream so capture stays snappy.
   Future<Uint8List> _captureStillBytes(CameraController ctrl) async {
@@ -429,8 +403,7 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
     final focalMm = _simFocalMm;
     final ev = _ev;
     final cropFraction = _simCrop;
-    final cropAspectRatio = _viewfinderFormat.aspectRatio;
-    final gate = _fovGateFractions;
+    final cropAspectRatio = _simFormat.aspectRatio;
 
     setState(() => _saving = true);
     late final Uint8List jpeg;
@@ -463,8 +436,6 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
         ev: ev,
         cropFraction: cropFraction,
         cropAspectRatio: cropAspectRatio,
-        insetWidthFrac: gate?.width,
-        insetHeightFrac: gate?.height,
       ),
     );
   }
@@ -481,16 +452,12 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
     required double? ev,
     required double cropFraction,
     required double cropAspectRatio,
-    double? insetWidthFrac,
-    double? insetHeightFrac,
   }) async {
     try {
       final bytes = await cropFilmJpegInBackground(
         jpegBytes: jpeg,
         cropFraction: cropFraction,
         cropAspectRatio: cropAspectRatio,
-        insetWidthFrac: insetWidthFrac,
-        insetHeightFrac: insetHeightFrac,
       );
       await AlbumShotStore.add(
         jpegBytes: bytes,
@@ -645,6 +612,16 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
         (local.dx / w).clamp(0.0, 1.0),
         (local.dy / h).clamp(0.0, 1.0),
       );
+      _ev = null;
+    });
+    _measure();
+  }
+
+  /// Reset the metering spot to the centre of the viewfinder and re-meter.
+  void _centerMeterPoint() {
+    if (_measuring || _saving) return;
+    setState(() {
+      _meterPoint = const Offset(0.5, 0.5);
       _ev = null;
     });
     _measure();
@@ -868,17 +845,14 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
   Widget _buildPreview(CameraController ctrl) {
     return Column(
       children: [
-        _buildFormatBar(),
         Expanded(
           child: LayoutBuilder(
             builder: (ctx, constraints) {
               final crop = _simCrop;
-              final viewFormat = _viewfinderFormat;
-              final gate = _fovGateFractions;
               final fitted = FilmOptics.fitAspect(
                 maxWidth: constraints.maxWidth,
                 maxHeight: constraints.maxHeight,
-                aspect: viewFormat.aspectRatio,
+                aspect: _simFormat.aspectRatio,
               );
               final viewSize = Size(fitted.width, fitted.height);
               _previewSize = viewSize;
@@ -896,17 +870,21 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
                         ClipRect(
                           child: Transform.scale(
                             scale: 1.0 / crop,
-                            child: OverflowBox(
+                            alignment: Alignment.center,
+                            child: FittedBox(
+                              fit: BoxFit.cover,
                               alignment: Alignment.center,
-                              child: FittedBox(
-                                fit: BoxFit.cover,
-                                child: SizedBox(
-                                  width: ctrl.value.previewSize?.height ??
-                                      viewSize.width,
-                                  height: ctrl.value.previewSize?.width ??
-                                      viewSize.height,
-                                  child: CameraPreview(ctrl),
-                                ),
+                              child: SizedBox(
+                                // previewSize is sensor-oriented (usually
+                                // landscape); swap so the child matches the
+                                // portrait CameraPreview aspect. Parent
+                                // constraints stay tight — no OverflowBox —
+                                // so cover scales against the viewfinder.
+                                width: ctrl.value.previewSize?.height ??
+                                    viewSize.width,
+                                height: ctrl.value.previewSize?.width ??
+                                    viewSize.height,
+                                child: CameraPreview(ctrl),
                               ),
                             ),
                           ),
@@ -916,8 +894,6 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
                             painter: _FilmFramePainter(
                               color: _accent,
                               showThirds: true,
-                              gateWidthFrac: gate?.width,
-                              gateHeightFrac: gate?.height,
                             ),
                           ),
                         ),
@@ -948,6 +924,33 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
                             ],
                           ),
                         ),
+                        Positioned(
+                          bottom: 8,
+                          right: 8,
+                          child: Material(
+                            color: Colors.black54,
+                            borderRadius: BorderRadius.circular(10),
+                            child: IconButton(
+                              tooltip: 'Center spot',
+                              onPressed: (_measuring || _saving)
+                                  ? null
+                                  : _centerMeterPoint,
+                              visualDensity: VisualDensity.compact,
+                              padding: const EdgeInsets.all(8),
+                              constraints: const BoxConstraints(
+                                minWidth: 40,
+                                minHeight: 40,
+                              ),
+                              icon: Icon(
+                                Icons.filter_center_focus,
+                                size: 22,
+                                color: (_measuring || _saving)
+                                    ? Colors.white38
+                                    : _accent,
+                              ),
+                            ),
+                          ),
+                        ),
                       ],
                     ),
                   ),
@@ -969,76 +972,10 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.center,
         children: [
-          const Expanded(
-            child: Text(
-              'Tap to meter',
-              style: TextStyle(
-                color: Colors.white54,
-                fontSize: 10,
-              ),
-            ),
-          ),
-          _shutterButton(),
-          const SizedBox(width: 8),
-          _meterButton(),
-          const SizedBox(width: 6),
           _albumButton(),
+          const Expanded(child: SizedBox.shrink()),
+          _shutterButton(),
         ],
-      ),
-    );
-  }
-
-  Widget _buildFormatBar() {
-    final formats = _allowedFormats;
-    // Each roll locks one frame; chip still shows so the gate is obvious.
-    return Container(
-      height: 34,
-      color: const Color(0xFF0F0F0F),
-      child: ListView(
-        scrollDirection: Axis.horizontal,
-        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-        children: [
-          for (final format in formats) ...[
-            _formatChip(format),
-            const SizedBox(width: 6),
-          ],
-        ],
-      ),
-    );
-  }
-
-  Widget _formatChip(FilmFormat format) {
-    final selected = _simFormat == format;
-    return GestureDetector(
-      onTap: () {
-        setState(() {
-          final switching = _simFormat != format;
-          _simFormat = format;
-          if (switching) {
-            _simFocalMm = format.defaultFocalMm;
-            _meterPoint = const Offset(0.5, 0.5);
-          }
-        });
-      },
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 10),
-        alignment: Alignment.center,
-        decoration: BoxDecoration(
-          color:
-              selected ? _accent.withValues(alpha: 0.9) : const Color(0xFF1A1A1A),
-          borderRadius: BorderRadius.circular(7),
-          border: Border.all(
-            color: selected ? _accent : Colors.white12,
-          ),
-        ),
-        child: Text(
-          format.label,
-          style: TextStyle(
-            color: selected ? Colors.black : Colors.white70,
-            fontWeight: selected ? FontWeight.w800 : FontWeight.w500,
-            fontSize: 12,
-          ),
-        ),
       ),
     );
   }
@@ -1053,78 +990,78 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
 
     return Container(
       color: const Color(0xFF0F0F0F),
-      padding: const EdgeInsets.fromLTRB(8, 0, 8, 4),
-      child: Row(
+      padding: const EdgeInsets.fromLTRB(8, 2, 8, 4),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          SizedBox(
-            width: 28,
-            child: Text(
-              '${lenses.first.round()}',
-              textAlign: TextAlign.center,
-              style: const TextStyle(
-                fontSize: 10,
-                color: Colors.white54,
-                fontWeight: FontWeight.w600,
-              ),
+          Text(
+            '${_simFormat.label}  ·  ${_simFocalMm.round()} mm'
+            '  (≈ ${_simFormat.to35mmEquivalent(_simFocalMm).round()} mm eq)',
+            textAlign: TextAlign.center,
+            style: const TextStyle(
+              fontSize: 12,
+              fontWeight: FontWeight.w700,
+              color: _accent,
             ),
           ),
-          Expanded(
-            child: SliderTheme(
-              data: SliderTheme.of(context).copyWith(
-                trackHeight: 2.5,
-                activeTrackColor: _accent,
-                inactiveTrackColor: Colors.white12,
-                thumbColor: _accent,
-                overlayColor: _accent.withValues(alpha: 0.2),
-                activeTickMarkColor: _accent,
-                inactiveTickMarkColor: Colors.white38,
-                tickMarkShape: const RoundSliderTickMarkShape(
-                  tickMarkRadius: 2,
-                ),
-                thumbShape: const RoundSliderThumbShape(
-                  enabledThumbRadius: 6.5,
-                ),
-                overlayShape: const RoundSliderOverlayShape(
-                  overlayRadius: 12,
+          Row(
+            children: [
+              SizedBox(
+                width: 28,
+                child: Text(
+                  '${lenses.first.round()}',
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(
+                    fontSize: 10,
+                    color: Colors.white54,
+                    fontWeight: FontWeight.w600,
+                  ),
                 ),
               ),
-              child: Slider(
-                value: index.toDouble().clamp(0, last.toDouble()),
-                min: 0,
-                max: last.toDouble(),
-                divisions: last,
-                label: '${lenses[index].round()} mm',
-                onChanged: _onFocalSliderChanged,
+              Expanded(
+                child: SliderTheme(
+                  data: SliderTheme.of(context).copyWith(
+                    trackHeight: 2.5,
+                    activeTrackColor: _accent,
+                    inactiveTrackColor: Colors.white12,
+                    thumbColor: _accent,
+                    overlayColor: _accent.withValues(alpha: 0.2),
+                    activeTickMarkColor: _accent,
+                    inactiveTickMarkColor: Colors.white38,
+                    tickMarkShape: const RoundSliderTickMarkShape(
+                      tickMarkRadius: 2,
+                    ),
+                    thumbShape: const RoundSliderThumbShape(
+                      enabledThumbRadius: 6.5,
+                    ),
+                    overlayShape: const RoundSliderOverlayShape(
+                      overlayRadius: 12,
+                    ),
+                  ),
+                  child: Slider(
+                    value: index.toDouble().clamp(0, last.toDouble()),
+                    min: 0,
+                    max: last.toDouble(),
+                    divisions: last,
+                    label: '${lenses[index].round()} mm',
+                    onChanged: _onFocalSliderChanged,
+                  ),
+                ),
               ),
-            ),
-          ),
-          SizedBox(
-            width: 30,
-            child: Text(
-              '${lenses.last.round()}',
-              textAlign: TextAlign.center,
-              maxLines: 1,
-              style: const TextStyle(
-                fontSize: 10,
-                color: Colors.white54,
-                fontWeight: FontWeight.w600,
+              SizedBox(
+                width: 36,
+                child: Text(
+                  '${lenses.last.round()}',
+                  textAlign: TextAlign.center,
+                  maxLines: 1,
+                  style: const TextStyle(
+                    fontSize: 10,
+                    color: Colors.white54,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
               ),
-            ),
-          ),
-          const SizedBox(width: 4),
-          SizedBox(
-            width: 58,
-            child: Text(
-              '${_simFocalMm.round()} mm',
-              textAlign: TextAlign.end,
-              maxLines: 1,
-              softWrap: false,
-              style: const TextStyle(
-                fontSize: 12,
-                fontWeight: FontWeight.w800,
-                color: _accent,
-              ),
-            ),
+            ],
           ),
         ],
       ),
@@ -1173,38 +1110,10 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
     );
   }
 
-  Widget _meterButton() {
-    return FilledButton.icon(
-      onPressed: (_measuring || _saving) ? null : () => _measure(),
-      style: FilledButton.styleFrom(
-        backgroundColor: _accent,
-        foregroundColor: Colors.black,
-        visualDensity: VisualDensity.compact,
-        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-        minimumSize: const Size(0, 32),
-        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-      ),
-      icon: _measuring
-          ? const SizedBox(
-              width: 12,
-              height: 12,
-              child: CircularProgressIndicator(
-                strokeWidth: 2,
-                color: Colors.black,
-              ),
-            )
-          : const Icon(Icons.center_focus_strong, size: 14),
-      label: Text(
-        _measuring ? 'Metering' : 'Meter',
-        style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
-      ),
-    );
-  }
-
   Widget _albumButton() {
     return IconButton(
       tooltip: 'Album',
-      onPressed: (_measuring || _saving) ? null : _openAlbum,
+      onPressed: _openAlbum,
       visualDensity: VisualDensity.compact,
       padding: EdgeInsets.zero,
       constraints: const BoxConstraints(minWidth: 36, minHeight: 32),
@@ -1751,71 +1660,21 @@ class _FilmFramePainter extends CustomPainter {
   final Color color;
   final bool showThirds;
 
-  /// Optional FOV gate inside the viewfinder (e.g. 645 inside 6×6).
-  final double? gateWidthFrac;
-  final double? gateHeightFrac;
-
   _FilmFramePainter({
     required this.color,
     this.showThirds = true,
-    this.gateWidthFrac,
-    this.gateHeightFrac,
   });
 
   @override
   void paint(Canvas canvas, Size size) {
-    final outer = Offset.zero & size;
-    final hasGate = gateWidthFrac != null &&
-        gateHeightFrac != null &&
-        (gateWidthFrac! < 0.999 || gateHeightFrac! < 0.999);
-
-    late final Rect frame;
-    if (hasGate) {
-      final gw = size.width * gateWidthFrac!.clamp(0.05, 1.0);
-      final gh = size.height * gateHeightFrac!.clamp(0.05, 1.0);
-      frame = Rect.fromCenter(
-        center: Offset(size.width / 2, size.height / 2),
-        width: gw,
-        height: gh,
-      );
-
-      // Dim area outside the FOV gate.
-      final dim = Path()
-        ..addRect(outer)
-        ..addRect(frame)
-        ..fillType = PathFillType.evenOdd;
-      canvas.drawPath(
-        dim,
-        Paint()..color = Colors.black.withValues(alpha: 0.45),
-      );
-
-      // Quiet outer square edge.
-      canvas.drawRect(
-        outer.deflate(1),
-        Paint()
-          ..color = Colors.white24
-          ..strokeWidth = 1
-          ..style = PaintingStyle.stroke,
-      );
-
-      // Highlighted FOV border.
-      canvas.drawRect(
-        frame.deflate(0.5),
-        Paint()
-          ..color = color.withValues(alpha: 0.95)
-          ..strokeWidth = 2.5
-          ..style = PaintingStyle.stroke,
-      );
-    } else {
-      frame = outer.deflate(1);
-      canvas.drawRect(
-        frame,
-        Paint()
-          ..color = color.withValues(alpha: 0.85)
-          ..strokeWidth = 2
-          ..style = PaintingStyle.stroke,
-      );
-    }
+    final frame = (Offset.zero & size).deflate(1);
+    canvas.drawRect(
+      frame,
+      Paint()
+        ..color = color.withValues(alpha: 0.85)
+        ..strokeWidth = 2
+        ..style = PaintingStyle.stroke,
+    );
 
     if (!showThirds) return;
 
@@ -1846,10 +1705,7 @@ class _FilmFramePainter extends CustomPainter {
 
   @override
   bool shouldRepaint(covariant _FilmFramePainter old) =>
-      color != old.color ||
-      showThirds != old.showThirds ||
-      gateWidthFrac != old.gateWidthFrac ||
-      gateHeightFrac != old.gateHeightFrac;
+      color != old.color || showThirds != old.showThirds;
 }
 
 class _SpotPainter extends CustomPainter {

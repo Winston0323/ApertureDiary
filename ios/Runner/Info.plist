@@ -55,6 +55,8 @@
 	<string>Main</string>
 	<key>NSCameraUsageDescription</key>
 	<string>需要使用相机进行测光</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>需要访问相册以导入冲洗扫描的照片</string>
 	<key>UISupportedInterfaceOrientations</key>
 	<array>
 		<string>UIInterfaceOrientationPortrait</string>

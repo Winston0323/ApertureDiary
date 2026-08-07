@@ -28,17 +28,7 @@ class FilmFormat {
 
   bool get isSquare => (aspectRatio - 1.0).abs() < 0.01;
 
-  /// Size of this frame as fractions of [host]'s width/height (shared centre).
-  ///
-  /// Used when a smaller gate (e.g. 645) is drawn inside a larger viewfinder
-  /// (e.g. 6×6).
-  ({double width, double height}) fractionsInside(FilmFormat host) {
-    final w = host.widthMm <= 0 ? 1.0 : widthMm / host.widthMm;
-    final h = host.heightMm <= 0 ? 1.0 : heightMm / host.heightMm;
-    return (width: w.clamp(0.05, 1.0), height: h.clamp(0.05, 1.0));
-  }
-
-  /// 35 mm-equivalent focal length of a lens on this format.
+  /// 35 mm-equivalent focal length of a lens on this format (diagonal crop).
   double to35mmEquivalent(double focalMm) =>
       focalMm * FilmOptics.fullFrameDiagonalMm / diagonalMm;
 
@@ -62,12 +52,12 @@ class FilmFormat {
     defaultFocalMm: 75,
   );
 
-  /// 120 film 6×6 — 60×60 mm.
+  /// 120 film 6×6 — actual image gate ≈ 56×56 mm (not the full 60 mm film).
   static const FilmFormat sixBySix = FilmFormat(
     id: '6x6',
     label: '6×6',
-    widthMm: 60,
-    heightMm: 60,
+    widthMm: 56,
+    heightMm: 56,
     standardLensesMm: [40, 50, 60, 75, 80, 100, 120, 150, 180, 250],
     defaultFocalMm: 80,
   );
@@ -100,6 +90,20 @@ class FilmOptics {
     return 2 * atan((sideMm / 2) / focalMm);
   }
 
+  /// 35 mm-equivalent focal length from physical sensor size (diagonal FOV).
+  static double equivalent35mmFromSensor({
+    required double focalMm,
+    required double sensorWidthMm,
+    required double sensorHeightMm,
+  }) {
+    if (focalMm <= 0 || sensorWidthMm <= 0 || sensorHeightMm <= 0) {
+      return double.nan;
+    }
+    final diagonal =
+        sqrt(sensorWidthMm * sensorWidthMm + sensorHeightMm * sensorHeightMm);
+    return focalMm * fullFrameDiagonalMm / diagonal;
+  }
+
   static String formatFocal(double mm) {
     if (!mm.isFinite || mm <= 0) return '—';
     if ((mm - mm.round()).abs() < 0.05) return '${mm.round()} mm';
@@ -121,12 +125,29 @@ class FilmOptics {
     return (width: maxWidth, height: maxWidth / aspect);
   }
 
-  /// Fraction of the phone's current covered view to keep in order to match
-  /// [simulatedFocalMm] on [format].
+  /// Maps Camera2 landscape sensor size onto on-screen axes.
   ///
-  /// Uses the phone sensor's physical size when available: first take the
-  /// centre strip of the sensor that has the film's aspect ratio (as
-  /// `BoxFit.cover` does), then match horizontal FOV.
+  /// When the preview is portrait-locked, the short sensor side is horizontal
+  /// on screen and the long side is vertical.
+  static ({double horizMm, double vertMm}) screenAxesFromSensor({
+    required double sensorWidthMm,
+    required double sensorHeightMm,
+    bool previewPortrait = true,
+  }) {
+    final short = min(sensorWidthMm, sensorHeightMm);
+    final long = max(sensorWidthMm, sensorHeightMm);
+    if (previewPortrait) {
+      return (horizMm: short, vertMm: long);
+    }
+    return (horizMm: long, vertMm: short);
+  }
+
+  /// Fraction of the phone's covered view to keep to match [simulatedFocalMm]
+  /// on [format].
+  ///
+  /// Maps the physical sensor onto screen axes for the locked preview
+  /// orientation, takes the centred strip that covers the film aspect (as
+  /// `BoxFit.cover` does), then matches horizontal FOV.
   static double cropFraction({
     required FilmFormat format,
     required double phoneFocalMm,
@@ -134,6 +155,7 @@ class FilmOptics {
     required double phoneSensorHeightMm,
     required double simulatedFocalMm,
     double zoom = 1.0,
+    bool previewPortrait = true,
   }) {
     if (phoneFocalMm <= 0 ||
         phoneSensorWidthMm <= 0 ||
@@ -144,19 +166,24 @@ class FilmOptics {
     }
 
     final fPhone = phoneFocalMm * zoom;
-    final phoneAspect = phoneSensorWidthMm / phoneSensorHeightMm;
+    final screen = screenAxesFromSensor(
+      sensorWidthMm: phoneSensorWidthMm,
+      sensorHeightMm: phoneSensorHeightMm,
+      previewPortrait: previewPortrait,
+    );
+    final phoneAspect = screen.horizMm / screen.vertMm;
     final filmAspect = format.aspectRatio;
 
-    // Sensor region visible after covering the film aspect.
-    final double visibleWidthMm;
+    // Sensor region visible after covering the film aspect on screen.
+    final double visibleHorizMm;
     if (phoneAspect > filmAspect) {
-      // Phone relatively wider — height fills, sides cropped.
-      visibleWidthMm = phoneSensorHeightMm * filmAspect;
+      // Screen relatively wider — height fills, sides cropped.
+      visibleHorizMm = screen.vertMm * filmAspect;
     } else {
-      visibleWidthMm = phoneSensorWidthMm;
+      visibleHorizMm = screen.horizMm;
     }
 
-    final fovPhone = fieldOfViewRadians(fPhone, visibleWidthMm);
+    final fovPhone = fieldOfViewRadians(fPhone, visibleHorizMm);
     final fovSim = fieldOfViewRadians(simulatedFocalMm, format.widthMm);
     if (!fovPhone.isFinite || !fovSim.isFinite || fovPhone <= 0) return 1.0;
     if (fovSim >= fovPhone) return 1.0;
@@ -165,6 +192,10 @@ class FilmOptics {
   }
 
   /// Crop using 35 mm-equivalent focal lengths when sensor size is unknown.
+  ///
+  /// Matches the film's native horizontal FOV to the phone's horizontal FOV
+  /// implied by a diagonal 35 mm-equivalent (assuming a typical 4:3 phone
+  /// sensor, where width/diagonal ≈ 0.8).
   static double cropFractionFrom35mm({
     required FilmFormat format,
     required double phone35mmEquivalent,
@@ -174,10 +205,18 @@ class FilmOptics {
     if (phone35mmEquivalent <= 0 || simulatedFocalMm <= 0 || zoom <= 0) {
       return 1.0;
     }
-    final sim35 = format.to35mmEquivalent(simulatedFocalMm);
     final phone = phone35mmEquivalent * zoom;
-    if (sim35 <= phone) return 1.0;
-    return (phone / sim35).clamp(0.05, 1.0);
+    // 4:3 sensor: width = 0.8 × diagonal. At diagonal-eq E, horizontal FOV
+    // equals 2·atan((0.4 × 43.27) / E).
+    const phoneWidthOverDiagonal = 0.8;
+    final phoneWidthMm = fullFrameDiagonalMm * phoneWidthOverDiagonal;
+    final fovPhone = fieldOfViewRadians(phone, phoneWidthMm);
+    final fovSim =
+        fieldOfViewRadians(simulatedFocalMm, format.widthMm);
+    if (!fovPhone.isFinite || !fovSim.isFinite || fovPhone <= 0) return 1.0;
+    if (fovSim >= fovPhone) return 1.0;
+
+    return (tan(fovSim / 2) / tan(fovPhone / 2)).clamp(0.05, 1.0);
   }
 
   /// Maps a tap in the viewfinder (0..1) back into the cover-fitted preview

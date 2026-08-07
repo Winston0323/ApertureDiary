@@ -19,6 +19,7 @@ class AlbumShot {
     this.focalMm,
     this.ev,
     this.flash = false,
+    this.scanImagePath,
   });
 
   final String id;
@@ -36,6 +37,14 @@ class AlbumShot {
   final double? ev;
   final bool flash;
 
+  /// Optional developed/scanned JPEG paired with this meter capture.
+  final String? scanImagePath;
+
+  bool get hasScan {
+    final path = scanImagePath;
+    return path != null && path.isNotEmpty;
+  }
+
   AlbumShot copyWith({
     String? id,
     String? imagePath,
@@ -49,6 +58,8 @@ class AlbumShot {
     double? focalMm,
     double? ev,
     bool? flash,
+    String? scanImagePath,
+    bool clearScan = false,
   }) {
     return AlbumShot(
       id: id ?? this.id,
@@ -63,6 +74,8 @@ class AlbumShot {
       focalMm: focalMm ?? this.focalMm,
       ev: ev ?? this.ev,
       flash: flash ?? this.flash,
+      scanImagePath:
+          clearScan ? null : (scanImagePath ?? this.scanImagePath),
     );
   }
 
@@ -79,6 +92,7 @@ class AlbumShot {
         'focalMm': focalMm,
         'ev': ev,
         'flash': flash,
+        'scanImagePath': scanImagePath,
       };
 
   static AlbumShot? fromJson(Map<String, dynamic> json) {
@@ -101,6 +115,9 @@ class AlbumShot {
     final takenAt = DateTime.tryParse(takenRaw);
     if (takenAt == null) return null;
 
+    final scanRaw = json['scanImagePath'];
+    final scanPath = scanRaw is String && scanRaw.isNotEmpty ? scanRaw : null;
+
     return AlbumShot(
       id: id,
       imagePath: imagePath,
@@ -116,6 +133,7 @@ class AlbumShot {
       focalMm: (json['focalMm'] as num?)?.toDouble(),
       ev: (json['ev'] as num?)?.toDouble(),
       flash: json['flash'] == true,
+      scanImagePath: scanPath,
     );
   }
 }
@@ -162,6 +180,19 @@ class AlbumShotStore {
     return File('${dir.path}${Platform.pathSeparator}$_metaFileName');
   }
 
+  static String _scanPathForId(Directory dir, String shotId) =>
+      '${dir.path}${Platform.pathSeparator}$shotId-scan.jpg';
+
+  static Future<void> _deleteFileQuietly(String? path) async {
+    if (path == null || path.isEmpty) return;
+    try {
+      final file = File(path);
+      if (await file.exists()) await file.delete();
+    } catch (_) {
+      // Best effort.
+    }
+  }
+
   static Future<List<AlbumShot>> load() async {
     try {
       final file = await _metaFile();
@@ -176,9 +207,13 @@ class AlbumShotStore {
                 ? Map<String, dynamic>.from(item)
                 : null;
         if (map == null) continue;
-        final shot = AlbumShot.fromJson(map);
+        var shot = AlbumShot.fromJson(map);
         if (shot == null) continue;
         if (!await File(shot.imagePath).exists()) continue;
+        final scan = shot.scanImagePath;
+        if (scan != null && !await File(scan).exists()) {
+          shot = shot.copyWith(clearScan: true);
+        }
         shots.add(shot);
       }
       shots.sort((a, b) => b.takenAt.compareTo(a.takenAt));
@@ -247,16 +282,49 @@ class AlbumShotStore {
     _notifyChanged();
   }
 
+  /// Writes a developed/scanned JPEG for [shotId], replacing any previous scan.
+  static Future<AlbumShot?> setScan({
+    required String shotId,
+    required Uint8List jpegBytes,
+  }) async {
+    final shots = await load();
+    final index = shots.indexWhere((s) => s.id == shotId);
+    if (index < 0) return null;
+
+    final existing = shots[index];
+    final dir = await _albumDir();
+    final path = _scanPathForId(dir, shotId);
+    await _deleteFileQuietly(existing.scanImagePath);
+    await File(path).writeAsBytes(jpegBytes, flush: true);
+
+    final updated = existing.copyWith(scanImagePath: path);
+    shots[index] = updated;
+    await _saveAll(shots);
+    _notifyChanged();
+    return updated;
+  }
+
+  /// Removes the scan image for [shotId], if any.
+  static Future<AlbumShot?> clearScan(String shotId) async {
+    final shots = await load();
+    final index = shots.indexWhere((s) => s.id == shotId);
+    if (index < 0) return null;
+
+    final existing = shots[index];
+    await _deleteFileQuietly(existing.scanImagePath);
+    final updated = existing.copyWith(clearScan: true);
+    shots[index] = updated;
+    await _saveAll(shots);
+    _notifyChanged();
+    return updated;
+  }
+
   static Future<void> remove(AlbumShot shot) async {
     final shots = await load();
     shots.removeWhere((s) => s.id == shot.id);
     await _saveAll(shots);
-    try {
-      final file = File(shot.imagePath);
-      if (await file.exists()) await file.delete();
-    } catch (_) {
-      // Best effort.
-    }
+    await _deleteFileQuietly(shot.imagePath);
+    await _deleteFileQuietly(shot.scanImagePath);
     _notifyChanged();
   }
 }

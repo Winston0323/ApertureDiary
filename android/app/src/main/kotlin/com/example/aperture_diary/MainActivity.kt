@@ -7,8 +7,7 @@ import android.os.Build
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
-import kotlin.math.atan
-import kotlin.math.tan
+import kotlin.math.sqrt
 
 class MainActivity : FlutterActivity() {
     private val channelName = "com.example.aperture_diary/lens"
@@ -46,18 +45,22 @@ class MainActivity : FlutterActivity() {
         val sensorWidth = sensor?.width?.toDouble()
         val sensorHeight = sensor?.height?.toDouble()
 
-        val primaryFocal = focals.minOrNull()
-            ?: focals.firstOrNull()
+        // Prefer the primary wide lens, not the ultra-wide: taking the shortest
+        // focal overstates the preview FOV and makes every simulation too wide.
+        val primaryFocal = selectPrimaryFocal(focals, sensorWidth, sensorHeight)
             ?: return null
 
         var equivalent35: Double? = null
         if (sensorWidth != null && sensorHeight != null && primaryFocal > 0) {
-            // Match the shorter side to a square crop, then express as 35 mm-eq
-            // via diagonal FOV against full-frame.
-            val short = minOf(sensorWidth, sensorHeight)
-            val phoneFov = 2.0 * atan((short / 2.0) / primaryFocal)
-            // Full-frame short side is 24 mm.
-            equivalent35 = (24.0 / 2.0) / tan(phoneFov / 2.0)
+            // Diagonal crop factor vs full-frame (43.27 mm), matching EXIF /
+            // FocalLengthIn35mmFilm and the Dart FilmOptics helper.
+            val diagonal = sqrt(
+                sensorWidth * sensorWidth + sensorHeight * sensorHeight,
+            )
+            val fullFrameDiagonal = 43.266615
+            if (diagonal > 0) {
+                equivalent35 = primaryFocal * fullFrameDiagonal / diagonal
+            }
         }
 
         return hashMapOf(
@@ -69,6 +72,30 @@ class MainActivity : FlutterActivity() {
             "cameraId" to id,
             "api" to Build.VERSION.SDK_INT,
         )
+    }
+
+    /// Picks the main (≈24–30 mm-eq) wide focal when a camera lists several.
+    private fun selectPrimaryFocal(
+        focals: List<Double>,
+        sensorWidth: Double?,
+        sensorHeight: Double?,
+    ): Double? {
+        val positive = focals.filter { it > 0 }.sorted()
+        if (positive.isEmpty()) return null
+        if (positive.size == 1) return positive.first()
+
+        if (sensorWidth != null && sensorHeight != null && sensorWidth > 0 && sensorHeight > 0) {
+            val diagonal = sqrt(sensorWidth * sensorWidth + sensorHeight * sensorHeight)
+            val fullFrameDiagonal = 43.266615
+            // Prefer the focal whose 35 mm-eq is closest to a "normal wide" 26 mm.
+            return positive.minBy { focal ->
+                val eq = focal * fullFrameDiagonal / diagonal
+                kotlin.math.abs(eq - 26.0)
+            }
+        }
+
+        // No sensor size: skip the shortest (often UW) when multiple exist.
+        return positive.getOrElse(1) { positive.first() }
     }
 
     private fun resolveCameraId(manager: CameraManager, cameraName: String?): String? {

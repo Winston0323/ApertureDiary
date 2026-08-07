@@ -79,18 +79,18 @@ marked, and the subject distance is shown in the header for reference.
 
 ## Focal simulation
 
-A format bar above the preview selects **Off**, **36×24**, **645**, or **6×6**.
-With a format selected, pick a focal length and the live viewfinder crops to that
-film's aspect ratio and field of view. The app reads the phone's native focal
-length and sensor size (Camera2 on Android, EXIF as fallback). Zoom is taken
-into account. Saved frames use the same crop and stamp the format + focal
-length on the border.
+The loaded roll locks the frame format (**36×24**, **645**, or **6×6**). The
+focal dial under the preview crops the live viewfinder to that format's aspect
+ratio and field of view at the chosen lens. The app reads the phone's native
+focal length and sensor size (Camera2 on Android, EXIF as fallback), maps the
+sensor onto the portrait preview axes, then matches horizontal FOV after
+covering the film aspect. Saved frames use the same crop.
 
 | Format | Frame | Default lens |
 | --- | --- | --- |
 | 36×24 | 36×24 mm (full frame) | 50 mm |
 | 645 | 56×41.5 mm | 75 mm |
-| 6×6 | 60×60 mm | 80 mm |
+| 6×6 | 56×56 mm (image gate) | 80 mm |
 
 The white shutter button on the preview captures the current frame, wraps it in
 a film-style border stamped with the shutter, aperture, and ISO from the
