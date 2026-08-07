@@ -28,6 +28,16 @@ class FilmFormat {
 
   bool get isSquare => (aspectRatio - 1.0).abs() < 0.01;
 
+  /// Size of this frame as fractions of [host]'s width/height (shared centre).
+  ///
+  /// Used when a smaller gate (e.g. 645) is drawn inside a larger viewfinder
+  /// (e.g. 6×6).
+  ({double width, double height}) fractionsInside(FilmFormat host) {
+    final w = host.widthMm <= 0 ? 1.0 : widthMm / host.widthMm;
+    final h = host.heightMm <= 0 ? 1.0 : heightMm / host.heightMm;
+    return (width: w.clamp(0.05, 1.0), height: h.clamp(0.05, 1.0));
+  }
+
   /// 35 mm-equivalent focal length of a lens on this format.
   double to35mmEquivalent(double focalMm) =>
       focalMm * FilmOptics.fullFrameDiagonalMm / diagonalMm;

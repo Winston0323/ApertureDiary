@@ -30,7 +30,8 @@ class FlashPage extends StatefulWidget {
 }
 
 class _FlashPageState extends State<FlashPage> {
-  late int _iso = widget.iso;
+  /// Locked to the film ISO from the light meter — edit ISO there only.
+  int get _iso => widget.iso;
   late double _aperture = widget.aperture;
 
   /// Guide number at ISO 100 and flash-to-subject distance, both in metres.
@@ -188,16 +189,6 @@ class _FlashPageState extends State<FlashPage> {
     return entered.clamp(lowest, highest);
   }
 
-  Future<void> _pickIso() async {
-    final chosen = await _showWheelPicker<int>(
-      title: 'Film ISO',
-      items: ExposureMath.standardIsos,
-      initial: _iso,
-      labelOf: (v) => '$v',
-    );
-    if (chosen != null) setState(() => _iso = chosen);
-  }
-
   Future<void> _pickAperture() async {
     final chosen = await _showWheelPicker<double>(
       title: 'Aperture',
@@ -250,11 +241,9 @@ class _FlashPageState extends State<FlashPage> {
             Row(
               children: [
                 Expanded(
-                  child: _pickerTile(
+                  child: _readOnlyTile(
                     label: 'Film ISO',
                     value: '$_iso',
-                    onTap: _pickIso,
-                    emphasize: true,
                   ),
                 ),
                 const SizedBox(width: 10),
@@ -373,6 +362,42 @@ class _FlashPageState extends State<FlashPage> {
                 ],
               ),
             ),
+        ],
+      ),
+    );
+  }
+
+  Widget _readOnlyTile({
+    required String label,
+    required String value,
+  }) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+      decoration: BoxDecoration(
+        color: const Color(0xFF1A1A1A),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: Colors.white12),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            label,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(fontSize: 11, color: Colors.white54),
+          ),
+          const SizedBox(height: 4),
+          Text(
+            value,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(
+              fontSize: 22,
+              fontWeight: FontWeight.w700,
+              color: Colors.white,
+            ),
+          ),
         ],
       ),
     );

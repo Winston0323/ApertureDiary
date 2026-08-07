@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 import 'dart:math' show max;
 
@@ -6,13 +7,16 @@ import 'package:exif/exif.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:gal/gal.dart';
 
+import 'album_page.dart';
+import 'album_shot.dart';
 import 'calibration.dart';
 import 'exposure.dart';
 import 'film_format.dart';
 import 'film_frame.dart';
+import 'film_stock.dart';
 import 'flash_page.dart';
+import 'home_page.dart';
 import 'lens_info.dart';
 import 'metering.dart';
 import 'wheel_dial.dart';
@@ -85,14 +89,33 @@ class ApertureDiaryApp extends StatelessWidget {
       title: 'ApertureDiary',
       debugShowCheckedModeBanner: false,
       theme: _darkTheme,
-      home: ApertureDiaryPage(camera: camera),
+      home: Builder(
+        builder: (context) => HomePage(
+          onOpenMeter: (film) {
+            Navigator.of(context).push(
+              MaterialPageRoute<void>(
+                builder: (_) => ApertureDiaryPage(
+                  camera: camera,
+                  film: film,
+                ),
+              ),
+            );
+          },
+        ),
+      ),
     );
   }
 }
 
 class ApertureDiaryPage extends StatefulWidget {
   final CameraDescription camera;
-  const ApertureDiaryPage({super.key, required this.camera});
+  final FilmStock film;
+
+  const ApertureDiaryPage({
+    super.key,
+    required this.camera,
+    required this.film,
+  });
 
   @override
   State<ApertureDiaryPage> createState() => _ApertureDiaryPageState();
@@ -119,6 +142,9 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
   double? _ev;
   double _calibration = 0.0;
 
+  /// RGB / calibration row; collapsed unless the user expands it.
+  bool _meterDetailsOpen = false;
+
   bool _measuring = false;
   bool _saving = false;
   String _status = 'Starting camera…';
@@ -140,14 +166,17 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
 
   /// Last factor the user set by hand. The opposite is what we solve for.
   LastEdited _lastEdited = LastEdited.aperture;
-  int _iso = 400;
+  /// Starts from the loaded film; editable only on this page.
+  late int _iso = widget.film.iso;
   double _aperture = 2.8;
   double _shutter = 1 / 125;
 
-  /// Focal-length viewfinder simulation (defaults to 6×6).
-  FilmFormat? _simFormat = FilmFormat.sixBySix;
-  double _simFocalMm = FilmFormat.sixBySix.defaultFocalMm;
+  /// Focal-length viewfinder simulation, limited by the loaded film's roll size.
+  late FilmFormat _simFormat = widget.film.frameFormat;
+  late double _simFocalMm = _simFormat.defaultFocalMm;
   LensInfo? _lensInfo;
+
+  List<FilmFormat> get _allowedFormats => widget.film.allowedFormats;
 
   final GlobalKey _previewKey = GlobalKey();
 
@@ -316,44 +345,59 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
     return parseExposureParams(tags);
   }
 
-  /// Centre-crop fraction for the current format simulation, or null when off.
-  double? get _simCrop {
-    final format = _simFormat;
-    if (format == null) return null;
+  /// Format used for the viewfinder window / phone FOV crop.
+  ///
+  /// 645 is shown inside a 6×6 feed with an FOV gate overlay.
+  FilmFormat get _viewfinderFormat =>
+      _simFormat == FilmFormat.sixFourFive
+          ? FilmFormat.sixBySix
+          : _simFormat;
+
+  /// Centre-crop fraction for the current format simulation.
+  double get _simCrop {
     final lens = _lensInfo;
     if (lens == null || !lens.isUsable) return 1.0;
-    return lens.cropForFormat(format, _simFocalMm, 1.0);
+    return lens.cropForFormat(_viewfinderFormat, _simFocalMm, 1.0);
   }
 
-  bool get _simLimited {
-    final crop = _simCrop;
-    return _simFormat != null && crop != null && crop >= 0.999;
+  bool get _simLimited => _simCrop >= 0.999;
+
+  /// Physical gate of [_simFormat] inside [_viewfinderFormat], when nested.
+  ///
+  /// 645 uses the full 6×6 width with a shorter height (645 aspect), so the
+  /// orange FOV border matches the square feed width.
+  ({double width, double height})? get _fovGateFractions {
+    if (_simFormat == FilmFormat.sixFourFive &&
+        _viewfinderFormat == FilmFormat.sixBySix) {
+      return (
+        width: 1.0,
+        height: FilmFormat.sixFourFive.heightMm / FilmFormat.sixFourFive.widthMm,
+      );
+    }
+    if (_simFormat == _viewfinderFormat) return null;
+    return _simFormat.fractionsInside(_viewfinderFormat);
   }
 
-  bool get _simEnabled => _simFormat != null;
-
-  /// Takes a still, stopping the analysis stream when the platform requires it.
+  /// Takes a still, pausing the preview analysis stream so capture stays snappy.
   Future<Uint8List> _captureStillBytes(CameraController ctrl) async {
-    XFile file;
-    var restartStream = false;
-    try {
-      file = await ctrl.takePicture();
-    } on CameraException {
-      if (!ctrl.value.isStreamingImages) rethrow;
+    final wasStreaming = ctrl.value.isStreamingImages;
+    if (wasStreaming) {
       await ctrl.stopImageStream();
-      restartStream = true;
-      file = await ctrl.takePicture();
     }
 
     try {
-      return await file.readAsBytes();
-    } finally {
+      final file = await ctrl.takePicture();
       try {
-        await File(file.path).delete();
-      } catch (_) {
-        // Temp file cleanup is best effort.
+        return await file.readAsBytes();
+      } finally {
+        try {
+          await File(file.path).delete();
+        } catch (_) {
+          // Temp file cleanup is best effort.
+        }
       }
-      if (restartStream && !ctrl.value.isStreamingImages) {
+    } finally {
+      if (wasStreaming && !ctrl.value.isStreamingImages) {
         await ctrl.startImageStream(_onFrame);
         try {
           await ctrl.setExposureMode(ExposureMode.locked);
@@ -364,8 +408,9 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
     }
   }
 
-  /// Captures the current frame, stamps film settings, and saves to the album.
-  Future<void> _saveFrame() async {
+  /// Captures a still and saves it to the in-app album (no border stamp, no
+  /// phone gallery write). Export-to-phone lives on the album detail page.
+  Future<void> _captureFrame() async {
     final ctrl = _controller;
     if (ctrl == null ||
         !ctrl.value.isInitialized ||
@@ -375,73 +420,96 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
       return;
     }
 
-    setState(() {
-      _saving = true;
-      _status = 'Saving…';
-    });
-
-    try {
-      final hasAccess = await Gal.hasAccess();
-      if (!hasAccess) {
-        final granted = await Gal.requestAccess();
-        if (!granted) {
-          if (mounted) {
-            setState(() => _status = 'Gallery permission denied');
-            _toast('Allow photo access to save frames');
-          }
-          return;
-        }
-      }
-
-      final jpeg = await _captureStillBytes(ctrl);
-      final stamped = await stampFilmFrame(
-        jpegBytes: jpeg,
-        caption: _filmCaption(),
-        cropFraction: _simCrop,
-        cropAspectRatio: _simFormat?.aspectRatio ?? 1.0,
-      );
-
-      final name =
-          'aperture_diary_${DateTime.now().millisecondsSinceEpoch}';
-      await Gal.putImageBytes(stamped, name: name, album: 'ApertureDiary');
-
-      if (!mounted) return;
-      setState(() => _status = 'Saved to album');
-      _toast('Saved to ApertureDiary album');
-    } on GalException catch (e) {
-      if (mounted) {
-        setState(() => _status = 'Save failed');
-        _toast(e.type.message);
-      }
-    } catch (e) {
-      if (mounted) {
-        setState(() => _status = 'Save failed');
-        _toast('Could not save: $e');
-      }
-    } finally {
-      _saving = false;
-      if (mounted) setState(() {});
-    }
-  }
-
-  FilmFrameCaption _filmCaption() {
     final shutter = _stampShutter();
     final aperture = _stampAperture();
+    final iso = _iso;
+    final filmId = widget.film.id;
+    final filmName = widget.film.name;
+    final formatLabel = _simFormat.label;
+    final focalMm = _simFocalMm;
     final ev = _ev;
-    final extras = <String>[];
-    if (_simFormat != null) {
-      extras.add(
-        '${_simFormat!.label} ${FilmOptics.formatFocal(_simFocalMm)}',
-      );
+    final cropFraction = _simCrop;
+    final cropAspectRatio = _viewfinderFormat.aspectRatio;
+    final gate = _fovGateFractions;
+
+    setState(() => _saving = true);
+    late final Uint8List jpeg;
+    try {
+      jpeg = await _captureStillBytes(ctrl);
+    } catch (e) {
+      if (mounted) _toast('Could not capture: $e');
+      return;
+    } finally {
+      if (mounted) {
+        setState(() => _saving = false);
+      } else {
+        _saving = false;
+      }
     }
 
-    return FilmFrameCaption(
-      shutter: shutter,
-      aperture: aperture,
-      iso: '$_iso',
-      ev: ev == null ? null : 'EV ${ev.toStringAsFixed(1)}',
-      extra: extras.isEmpty ? null : extras.join('  ·  '),
+    if (!mounted) return;
+    _toast('Saving to album…');
+    AlbumShotStore.beginBackgroundSave();
+    unawaited(
+      _saveCaptureToAlbum(
+        jpeg: jpeg,
+        shutter: shutter,
+        aperture: aperture,
+        iso: iso,
+        filmId: filmId,
+        filmName: filmName,
+        formatLabel: formatLabel,
+        focalMm: focalMm,
+        ev: ev,
+        cropFraction: cropFraction,
+        cropAspectRatio: cropAspectRatio,
+        insetWidthFrac: gate?.width,
+        insetHeightFrac: gate?.height,
+      ),
     );
+  }
+
+  Future<void> _saveCaptureToAlbum({
+    required Uint8List jpeg,
+    required String shutter,
+    required String aperture,
+    required int iso,
+    required String filmId,
+    required String filmName,
+    required String formatLabel,
+    required double focalMm,
+    required double? ev,
+    required double cropFraction,
+    required double cropAspectRatio,
+    double? insetWidthFrac,
+    double? insetHeightFrac,
+  }) async {
+    try {
+      final bytes = await cropFilmJpegInBackground(
+        jpegBytes: jpeg,
+        cropFraction: cropFraction,
+        cropAspectRatio: cropAspectRatio,
+        insetWidthFrac: insetWidthFrac,
+        insetHeightFrac: insetHeightFrac,
+      );
+      await AlbumShotStore.add(
+        jpegBytes: bytes,
+        shutter: shutter,
+        aperture: aperture,
+        iso: iso,
+        filmId: filmId,
+        filmName: filmName,
+        formatLabel: formatLabel,
+        focalMm: focalMm,
+        ev: ev,
+        flash: false,
+      );
+      if (mounted) _toast('Saved to album');
+    } catch (e) {
+      if (mounted) _toast('Could not save: $e');
+    } finally {
+      AlbumShotStore.endBackgroundSave();
+    }
   }
 
   bool get _solvingShutter => _lastEdited == LastEdited.aperture;
@@ -509,7 +577,7 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
 
       var spot = _meterPoint;
       final crop = _simCrop;
-      if (crop != null && crop < 1.0) {
+      if (crop < 1.0) {
         final mapped =
             FilmOptics.mapViewfinderToPreview(spot.dx, spot.dy, crop);
         spot = Offset(mapped.x, mapped.y);
@@ -583,8 +651,8 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
   }
 
   Future<void> _onFocalSliderChanged(double index) async {
-    final lenses = _simFormat?.standardLensesMm;
-    if (lenses == null || lenses.isEmpty) return;
+    final lenses = _simFormat.standardLensesMm;
+    if (lenses.isEmpty) return;
     final i = index.round().clamp(0, lenses.length - 1);
     setState(() => _simFocalMm = lenses[i]);
   }
@@ -612,20 +680,44 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
     return ExposureMath.formatAperture(ExposureMath.snapAperture(exact));
   }
 
-  String? get _solveNote {
+  /// Solved shutter or aperture at a given exposure-compensation stop.
+  ///
+  /// +EC means more exposure, so the calculator uses EV − EC.
+  String _valueAtCompensation(int compensationStops, {bool exact = false}) {
     final ev = _ev;
-    if (ev == null) return 'Meter a point to solve the highlighted factor';
+    if (ev == null) return '—';
+    final adjusted = ev - compensationStops;
     if (_solvingShutter) {
-      final exact =
-          ExposureMath.shutterFromEv(ev100: ev, aperture: _aperture, iso: _iso);
-      return 'exact ${ExposureMath.formatShutter(exact)}';
+      final seconds = ExposureMath.shutterFromEv(
+        ev100: adjusted,
+        aperture: _aperture,
+        iso: _iso,
+      );
+      return ExposureMath.formatShutter(
+        exact ? seconds : ExposureMath.snapShutter(seconds),
+      );
     }
-    final exact = ExposureMath.apertureFromEv(
-      ev100: ev,
+    final f = ExposureMath.apertureFromEv(
+      ev100: adjusted,
       shutterSeconds: _shutter,
       iso: _iso,
     );
-    return 'exact ${ExposureMath.formatAperture(exact)}';
+    return ExposureMath.formatAperture(
+      exact ? f : ExposureMath.snapAperture(f),
+    );
+  }
+
+  static String _formatCompensation(int stops) {
+    if (stops == 0) return '0';
+    return stops > 0 ? '+$stops' : '$stops';
+  }
+
+  void _openAlbum() {
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => AlbumPage(film: widget.film),
+      ),
+    );
   }
 
   void _openFlash() {
@@ -661,11 +753,32 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
         backgroundColor: const Color(0xFF0A0A0A),
         foregroundColor: Colors.white,
         elevation: 0,
-        title: const Text(
-          'ApertureDiary',
-          style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
+        title: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              widget.film.name,
+              style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
+            ),
+            Text(
+              '${widget.film.rollFormatLabel}  ·  ISO $_iso',
+              style: const TextStyle(fontSize: 11, color: Colors.white54),
+            ),
+          ],
         ),
         actions: [
+          TextButton.icon(
+            onPressed: _pickIso,
+            icon: const Icon(Icons.edit_outlined, size: 16, color: _accent),
+            label: Text(
+              'ISO $_iso',
+              style: const TextStyle(
+                color: _accent,
+                fontWeight: FontWeight.w800,
+                fontSize: 13,
+              ),
+            ),
+          ),
           IconButton(
             tooltip: 'Flash',
             icon: const Icon(Icons.flash_on),
@@ -743,12 +856,7 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
                 maxHeight: max(0, constraints.maxHeight - minimumPreviewHeight),
               ),
               child: SingleChildScrollView(
-                child: Column(
-                  children: [
-                    _buildMeterReadout(),
-                    _buildExposurePanel(),
-                  ],
-                ),
+                child: _buildExposurePanel(),
               ),
             ),
           ],
@@ -758,334 +866,265 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
   }
 
   Widget _buildPreview(CameraController ctrl) {
-    return Row(
+    return Column(
       children: [
-        if (_simEnabled) _buildFocalSlider(),
+        _buildFormatBar(),
         Expanded(
-          child: Column(
-            children: [
-              _buildFormatBar(),
-              Expanded(
-                child: LayoutBuilder(
-                  builder: (ctx, constraints) {
-                    const controlsHeight = 56.0;
-                    final crop = _simCrop ?? 1.0;
-                    final format = _simFormat;
-                    final frameMaxW = constraints.maxWidth;
-                    final frameMaxH = max(
-                      0.0,
-                      constraints.maxHeight - controlsHeight,
-                    );
-                    final Size viewSize;
-                    if (format != null) {
-                      final fitted = FilmOptics.fitAspect(
-                        maxWidth: frameMaxW,
-                        maxHeight: frameMaxH,
-                        aspect: format.aspectRatio,
-                      );
-                      viewSize = Size(fitted.width, fitted.height);
-                    } else {
-                      viewSize = Size(frameMaxW, frameMaxH);
-                    }
-                    _previewSize = viewSize;
+          child: LayoutBuilder(
+            builder: (ctx, constraints) {
+              final crop = _simCrop;
+              final viewFormat = _viewfinderFormat;
+              final gate = _fovGateFractions;
+              final fitted = FilmOptics.fitAspect(
+                maxWidth: constraints.maxWidth,
+                maxHeight: constraints.maxHeight,
+                aspect: viewFormat.aspectRatio,
+              );
+              final viewSize = Size(fitted.width, fitted.height);
+              _previewSize = viewSize;
 
-                    return Stack(
+              return Center(
+                child: SizedBox(
+                  key: _previewKey,
+                  width: viewSize.width,
+                  height: viewSize.height,
+                  child: GestureDetector(
+                    onTapUp: _onTapUp,
+                    child: Stack(
                       fit: StackFit.expand,
                       children: [
-                        // Format viewfinder — centred in the area above controls.
-                        Positioned(
-                          left: 0,
-                          right: 0,
-                          top: 0,
-                          bottom: controlsHeight,
-                          child: Center(
-                            child: SizedBox(
-                              key: _previewKey,
-                              width: viewSize.width,
-                              height: viewSize.height,
-                              child: GestureDetector(
-                                onTapUp: _onTapUp,
-                                child: Stack(
-                                  fit: StackFit.expand,
-                                  children: [
-                                    ClipRect(
-                                      child: Transform.scale(
-                                        scale:
-                                            _simEnabled ? (1.0 / crop) : 1.0,
-                                        child: OverflowBox(
-                                          alignment: Alignment.center,
-                                          child: FittedBox(
-                                            fit: BoxFit.cover,
-                                            child: SizedBox(
-                                              width: ctrl.value.previewSize
-                                                      ?.height ??
-                                                  viewSize.width,
-                                              height: ctrl.value.previewSize
-                                                      ?.width ??
-                                                  viewSize.height,
-                                              child: CameraPreview(ctrl),
-                                            ),
-                                          ),
-                                        ),
-                                      ),
-                                    ),
-                                    if (_simEnabled)
-                                      IgnorePointer(
-                                        child: CustomPaint(
-                                          painter: _FilmFramePainter(
-                                            color: _accent,
-                                            showThirds: true,
-                                          ),
-                                        ),
-                                      ),
-                                    CustomPaint(
-                                      painter: _SpotPainter(
-                                        point: _meterPoint,
-                                        radius: _spotRadius,
-                                        color: _accent,
-                                      ),
-                                    ),
-                                    if (_simEnabled)
-                                      Positioned(
-                                        top: 10,
-                                        right: 10,
-                                        child: _chip(
-                                          FilmOptics.formatFocal(_simFocalMm),
-                                        ),
-                                      ),
-                                    Positioned(
-                                      top: 10,
-                                      left: 10,
-                                      child: Column(
-                                        crossAxisAlignment:
-                                            CrossAxisAlignment.start,
-                                        children: [
-                                          _statusChip(),
-                                          if (_simEnabled &&
-                                              _lensInfo != null) ...[
-                                            const SizedBox(height: 6),
-                                            _chip(
-                                              'Lens ${_lensInfo!.focalLengthMm.toStringAsFixed(1)} mm',
-                                            ),
-                                          ],
-                                          if (_simLimited) ...[
-                                            const SizedBox(height: 6),
-                                            _chip('At phone FOV limit'),
-                                          ],
-                                        ],
-                                      ),
-                                    ),
-                                  ],
+                        ClipRect(
+                          child: Transform.scale(
+                            scale: 1.0 / crop,
+                            child: OverflowBox(
+                              alignment: Alignment.center,
+                              child: FittedBox(
+                                fit: BoxFit.cover,
+                                child: SizedBox(
+                                  width: ctrl.value.previewSize?.height ??
+                                      viewSize.width,
+                                  height: ctrl.value.previewSize?.width ??
+                                      viewSize.height,
+                                  child: CameraPreview(ctrl),
                                 ),
                               ),
                             ),
                           ),
                         ),
-                        // Shutter / meter — locked to the video box bottom.
+                        IgnorePointer(
+                          child: CustomPaint(
+                            painter: _FilmFramePainter(
+                              color: _accent,
+                              showThirds: true,
+                              gateWidthFrac: gate?.width,
+                              gateHeightFrac: gate?.height,
+                            ),
+                          ),
+                        ),
+                        CustomPaint(
+                          painter: _SpotPainter(
+                            point: _meterPoint,
+                            radius: _spotRadius,
+                            color: _accent,
+                          ),
+                        ),
                         Positioned(
-                          left: 12,
-                          right: 12,
-                          bottom: 8,
-                          height: controlsHeight - 8,
-                          child: Row(
-                            crossAxisAlignment: CrossAxisAlignment.center,
+                          top: 10,
+                          left: 10,
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
                             children: [
-                              const Expanded(
-                                child: Text(
-                                  'Tap to meter',
-                                  style: TextStyle(
-                                    color: Colors.white54,
-                                    fontSize: 11,
-                                    shadows: [
-                                      Shadow(
-                                        blurRadius: 4,
-                                        color: Colors.black,
-                                      ),
-                                    ],
-                                  ),
+                              _statusChip(),
+                              if (_lensInfo != null) ...[
+                                const SizedBox(height: 6),
+                                _chip(
+                                  'Lens ${_lensInfo!.focalLengthMm.toStringAsFixed(1)} mm',
                                 ),
-                              ),
-                              _shutterButton(),
-                              const SizedBox(width: 10),
-                              _meterButton(),
+                              ],
+                              if (_simLimited) ...[
+                                const SizedBox(height: 6),
+                                _chip('At phone FOV limit'),
+                              ],
                             ],
                           ),
                         ),
                       ],
-                    );
-                  },
+                    ),
+                  ),
                 ),
-              ),
-            ],
+              );
+            },
           ),
         ),
+        _buildShutterBar(),
+        _buildFocalSlider(),
       ],
     );
   }
 
-  Widget _buildFormatBar() {
+  Widget _buildShutterBar() {
     return Container(
-      height: 44,
+      color: const Color(0xFF0F0F0F),
+      padding: const EdgeInsets.fromLTRB(10, 4, 10, 2),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.center,
+        children: [
+          const Expanded(
+            child: Text(
+              'Tap to meter',
+              style: TextStyle(
+                color: Colors.white54,
+                fontSize: 10,
+              ),
+            ),
+          ),
+          _shutterButton(),
+          const SizedBox(width: 8),
+          _meterButton(),
+          const SizedBox(width: 6),
+          _albumButton(),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildFormatBar() {
+    final formats = _allowedFormats;
+    // Each roll locks one frame; chip still shows so the gate is obvious.
+    return Container(
+      height: 34,
       color: const Color(0xFF0F0F0F),
       child: ListView(
         scrollDirection: Axis.horizontal,
-        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
         children: [
-          _formatChip(null, 'Off'),
-          const SizedBox(width: 8),
-          for (final format in FilmFormat.all) ...[
-            _formatChip(format, format.label),
-            const SizedBox(width: 8),
+          for (final format in formats) ...[
+            _formatChip(format),
+            const SizedBox(width: 6),
           ],
         ],
       ),
     );
   }
 
-  Widget _formatChip(FilmFormat? format, String label) {
+  Widget _formatChip(FilmFormat format) {
     final selected = _simFormat == format;
     return GestureDetector(
       onTap: () {
         setState(() {
-          if (format == null) {
-            _simFormat = null;
-          } else {
-            final switching = _simFormat != format;
-            _simFormat = format;
-            if (switching) {
-              _simFocalMm = format.defaultFocalMm;
-              _meterPoint = const Offset(0.5, 0.5);
-            }
+          final switching = _simFormat != format;
+          _simFormat = format;
+          if (switching) {
+            _simFocalMm = format.defaultFocalMm;
+            _meterPoint = const Offset(0.5, 0.5);
           }
         });
       },
       child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 12),
+        padding: const EdgeInsets.symmetric(horizontal: 10),
         alignment: Alignment.center,
         decoration: BoxDecoration(
           color:
               selected ? _accent.withValues(alpha: 0.9) : const Color(0xFF1A1A1A),
-          borderRadius: BorderRadius.circular(8),
+          borderRadius: BorderRadius.circular(7),
           border: Border.all(
             color: selected ? _accent : Colors.white12,
           ),
         ),
         child: Text(
-          label,
+          format.label,
           style: TextStyle(
             color: selected ? Colors.black : Colors.white70,
             fontWeight: selected ? FontWeight.w800 : FontWeight.w500,
-            fontSize: 13,
+            fontSize: 12,
           ),
         ),
       ),
     );
   }
 
-  /// Vertical focal-length dial: one stop per typical lens, longest at the top.
+  /// Horizontal focal-length dial under the shutter controls.
   Widget _buildFocalSlider() {
-    final lenses = _simFormat!.standardLensesMm;
+    final lenses = _simFormat.standardLensesMm;
     final last = lenses.length - 1;
     var index = lenses.indexWhere((m) => (m - _simFocalMm).abs() < 0.01);
-    if (index < 0) index = lenses.indexOf(_simFormat!.defaultFocalMm);
+    if (index < 0) index = lenses.indexOf(_simFormat.defaultFocalMm);
     if (index < 0) index = 0;
 
-    // Slider runs wide (0) → tele (last); rotated so tele sits at the top.
     return Container(
-      width: 64,
       color: const Color(0xFF0F0F0F),
-      padding: const EdgeInsets.symmetric(vertical: 12),
-      child: Column(
+      padding: const EdgeInsets.fromLTRB(8, 0, 8, 4),
+      child: Row(
         children: [
-          Text(
-            '${lenses.last.round()}',
-            style: const TextStyle(
-              fontSize: 11,
-              color: Colors.white54,
-              fontWeight: FontWeight.w600,
+          SizedBox(
+            width: 28,
+            child: Text(
+              '${lenses.first.round()}',
+              textAlign: TextAlign.center,
+              style: const TextStyle(
+                fontSize: 10,
+                color: Colors.white54,
+                fontWeight: FontWeight.w600,
+              ),
             ),
           ),
-          const Text(
-            'mm',
-            style: TextStyle(fontSize: 9, color: Colors.white30),
-          ),
-          const SizedBox(height: 4),
           Expanded(
-            child: Stack(
-              alignment: Alignment.center,
-              children: [
-                // Segment tick marks behind the track.
-                Positioned.fill(
-                  child: Padding(
-                    padding: const EdgeInsets.symmetric(vertical: 10),
-                    child: CustomPaint(
-                      painter: _FocalTicksPainter(
-                        count: lenses.length,
-                        color: Colors.white24,
-                      ),
-                    ),
-                  ),
+            child: SliderTheme(
+              data: SliderTheme.of(context).copyWith(
+                trackHeight: 2.5,
+                activeTrackColor: _accent,
+                inactiveTrackColor: Colors.white12,
+                thumbColor: _accent,
+                overlayColor: _accent.withValues(alpha: 0.2),
+                activeTickMarkColor: _accent,
+                inactiveTickMarkColor: Colors.white38,
+                tickMarkShape: const RoundSliderTickMarkShape(
+                  tickMarkRadius: 2,
                 ),
-                RotatedBox(
-                  quarterTurns: -1,
-                  child: SliderTheme(
-                    data: SliderTheme.of(context).copyWith(
-                      trackHeight: 3,
-                      activeTrackColor: _accent,
-                      inactiveTrackColor: Colors.white12,
-                      thumbColor: _accent,
-                      overlayColor: _accent.withValues(alpha: 0.2),
-                      activeTickMarkColor: _accent,
-                      inactiveTickMarkColor: Colors.white38,
-                      tickMarkShape: const RoundSliderTickMarkShape(
-                        tickMarkRadius: 2.5,
-                      ),
-                      thumbShape: const RoundSliderThumbShape(
-                        enabledThumbRadius: 8,
-                      ),
-                      overlayShape: const RoundSliderOverlayShape(
-                        overlayRadius: 16,
-                      ),
-                    ),
-                    child: Slider(
-                      value: index.toDouble().clamp(0, last.toDouble()),
-                      min: 0,
-                      max: last.toDouble(),
-                      divisions: last,
-                      label: '${lenses[index].round()} mm',
-                      onChanged: _onFocalSliderChanged,
-                    ),
-                  ),
+                thumbShape: const RoundSliderThumbShape(
+                  enabledThumbRadius: 6.5,
                 ),
-              ],
+                overlayShape: const RoundSliderOverlayShape(
+                  overlayRadius: 12,
+                ),
+              ),
+              child: Slider(
+                value: index.toDouble().clamp(0, last.toDouble()),
+                min: 0,
+                max: last.toDouble(),
+                divisions: last,
+                label: '${lenses[index].round()} mm',
+                onChanged: _onFocalSliderChanged,
+              ),
             ),
           ),
-          const SizedBox(height: 4),
-          Text(
-            '${lenses.first.round()}',
-            style: const TextStyle(
-              fontSize: 11,
-              color: Colors.white54,
-              fontWeight: FontWeight.w600,
+          SizedBox(
+            width: 30,
+            child: Text(
+              '${lenses.last.round()}',
+              textAlign: TextAlign.center,
+              maxLines: 1,
+              style: const TextStyle(
+                fontSize: 10,
+                color: Colors.white54,
+                fontWeight: FontWeight.w600,
+              ),
             ),
           ),
-          const Text(
-            'mm',
-            style: TextStyle(fontSize: 9, color: Colors.white30),
-          ),
-          const SizedBox(height: 8),
-          Text(
-            '${_simFocalMm.round()}',
-            style: const TextStyle(
-              fontSize: 18,
-              fontWeight: FontWeight.w800,
-              color: _accent,
-              height: 1.0,
+          const SizedBox(width: 4),
+          SizedBox(
+            width: 58,
+            child: Text(
+              '${_simFocalMm.round()} mm',
+              textAlign: TextAlign.end,
+              maxLines: 1,
+              softWrap: false,
+              style: const TextStyle(
+                fontSize: 12,
+                fontWeight: FontWeight.w800,
+                color: _accent,
+              ),
             ),
-          ),
-          const Text(
-            'mm',
-            style: TextStyle(fontSize: 10, color: _accent),
           ),
         ],
       ),
@@ -1095,25 +1134,25 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
   Widget _shutterButton() {
     final busy = _saving || _measuring;
     return GestureDetector(
-      onTap: busy ? null : _saveFrame,
+      onTap: busy ? null : _captureFrame,
       child: AnimatedOpacity(
         opacity: busy ? 0.45 : 1,
         duration: const Duration(milliseconds: 150),
         child: Container(
-          width: 44,
-          height: 44,
+          width: 36,
+          height: 36,
           decoration: BoxDecoration(
             shape: BoxShape.circle,
             border: Border.all(color: Colors.white, width: 2),
             boxShadow: const [
               BoxShadow(
                 color: Colors.black54,
-                blurRadius: 6,
+                blurRadius: 4,
                 offset: Offset(0, 1),
               ),
             ],
           ),
-          padding: const EdgeInsets.all(3),
+          padding: const EdgeInsets.all(2.5),
           child: Container(
             decoration: BoxDecoration(
               shape: BoxShape.circle,
@@ -1121,7 +1160,7 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
             ),
             child: _saving
                 ? const Padding(
-                    padding: EdgeInsets.all(8),
+                    padding: EdgeInsets.all(6),
                     child: CircularProgressIndicator(
                       strokeWidth: 2,
                       color: Colors.black,
@@ -1141,24 +1180,35 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
         backgroundColor: _accent,
         foregroundColor: Colors.black,
         visualDensity: VisualDensity.compact,
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-        minimumSize: const Size(0, 36),
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+        minimumSize: const Size(0, 32),
         tapTargetSize: MaterialTapTargetSize.shrinkWrap,
       ),
       icon: _measuring
           ? const SizedBox(
-              width: 14,
-              height: 14,
+              width: 12,
+              height: 12,
               child: CircularProgressIndicator(
                 strokeWidth: 2,
                 color: Colors.black,
               ),
             )
-          : const Icon(Icons.center_focus_strong, size: 16),
+          : const Icon(Icons.center_focus_strong, size: 14),
       label: Text(
         _measuring ? 'Metering' : 'Meter',
-        style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
+        style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
       ),
+    );
+  }
+
+  Widget _albumButton() {
+    return IconButton(
+      tooltip: 'Album',
+      onPressed: (_measuring || _saving) ? null : _openAlbum,
+      visualDensity: VisualDensity.compact,
+      padding: EdgeInsets.zero,
+      constraints: const BoxConstraints(minWidth: 36, minHeight: 32),
+      icon: const Icon(Icons.photo_library_outlined, size: 22, color: Colors.white70),
     );
   }
 
@@ -1206,138 +1256,18 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
     );
   }
 
-  Widget _buildMeterReadout() {
+  Widget _buildExposurePanel() {
     final ev = _ev;
     final params = _params;
     final sample = _sample;
 
     return Container(
       width: double.infinity,
-      padding: const EdgeInsets.fromLTRB(20, 12, 20, 10),
+      padding: const EdgeInsets.fromLTRB(10, 4, 10, 8),
       decoration: const BoxDecoration(
-        color: Color(0xFF121212),
+        color: Color(0xFF0A0A0A),
         border: Border(top: BorderSide(color: Colors.white12)),
       ),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Row(
-                  crossAxisAlignment: CrossAxisAlignment.baseline,
-                  textBaseline: TextBaseline.alphabetic,
-                  children: [
-                    const Text(
-                      'EV ',
-                      style: TextStyle(
-                        fontSize: 18,
-                        color: Colors.white54,
-                        fontWeight: FontWeight.w300,
-                      ),
-                    ),
-                    Text(
-                      ev == null ? '—' : ev.toStringAsFixed(1),
-                      style: const TextStyle(
-                        fontSize: 40,
-                        color: _accent,
-                        fontWeight: FontWeight.w700,
-                        height: 1.0,
-                        letterSpacing: -1,
-                      ),
-                    ),
-                    const SizedBox(width: 6),
-                    if (ev != null)
-                      Text(
-                        _evToLabel(ev),
-                        style: const TextStyle(
-                          fontSize: 12,
-                          color: Colors.white54,
-                        ),
-                      ),
-                  ],
-                ),
-                const SizedBox(height: 4),
-                Text(
-                  params == null
-                      ? 'Waiting for a measurement'
-                      : 'Sensor ${params.summary}',
-                  style: const TextStyle(fontSize: 11, color: Colors.white38),
-                ),
-                if (sample != null && params != null)
-                  Text(
-                    'Spot ${ExposureMath.formatStops(sample.stopsFromMiddleGrey)} '
-                    'from mid-grey',
-                    style: TextStyle(
-                      fontSize: 11,
-                      color: sample.isUsable
-                          ? Colors.white38
-                          : Colors.orangeAccent,
-                    ),
-                  ),
-              ],
-            ),
-          ),
-          Column(
-            crossAxisAlignment: CrossAxisAlignment.end,
-            children: [
-              if (sample != null)
-                Container(
-                  padding:
-                      const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-                  decoration: BoxDecoration(
-                    color: Color.fromARGB(255, sample.r, sample.g, sample.b),
-                    borderRadius: BorderRadius.circular(8),
-                    border: Border.all(color: Colors.white24),
-                  ),
-                  child: Text(
-                    'R${sample.r} G${sample.g} B${sample.b}',
-                    style: TextStyle(
-                      fontSize: 11,
-                      fontWeight: FontWeight.w600,
-                      color: (sample.r + sample.g + sample.b) / 3 > 128
-                          ? Colors.black87
-                          : Colors.white,
-                    ),
-                  ),
-                ),
-              const SizedBox(height: 6),
-              InkWell(
-                onTap: _openCalibration,
-                borderRadius: BorderRadius.circular(8),
-                child: Container(
-                  padding:
-                      const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-                  decoration: BoxDecoration(
-                    color: const Color(0xFF1A1A1A),
-                    borderRadius: BorderRadius.circular(8),
-                    border: Border.all(color: Colors.white12),
-                  ),
-                  child: Text(
-                    'Cal ${_calibration >= 0 ? '+' : '−'}'
-                    '${_calibration.abs().toStringAsFixed(1)}',
-                    style: const TextStyle(
-                      fontSize: 11,
-                      color: Colors.white54,
-                      fontWeight: FontWeight.w600,
-                    ),
-                  ),
-                ),
-              ),
-            ],
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildExposurePanel() {
-    final note = _solveNote;
-    return Container(
-      width: double.infinity,
-      padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
-      color: const Color(0xFF0A0A0A),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
@@ -1345,12 +1275,18 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
             children: [
               Expanded(
                 child: _pickerTile(
-                  label: 'Film ISO',
-                  value: '$_iso',
-                  onTap: _pickIso,
+                  label: 'EV',
+                  value: ev == null ? '—' : ev.toStringAsFixed(1),
+                  onTap: () => setState(
+                    () => _meterDetailsOpen = !_meterDetailsOpen,
+                  ),
+                  emphasize: true,
+                  icon: _meterDetailsOpen
+                      ? Icons.expand_less
+                      : Icons.expand_more,
                 ),
               ),
-              const SizedBox(width: 10),
+              const SizedBox(width: 6),
               Expanded(
                 child: _pickerTile(
                   label: 'Shutter',
@@ -1359,7 +1295,7 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
                   emphasize: _solvingShutter,
                 ),
               ),
-              const SizedBox(width: 10),
+              const SizedBox(width: 6),
               Expanded(
                 child: _pickerTile(
                   label: 'Aperture',
@@ -1370,16 +1306,227 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
               ),
             ],
           ),
-          if (note != null) ...[
-            const SizedBox(height: 8),
+          if (_meterDetailsOpen) ...[
+            const SizedBox(height: 6),
+            if (ev != null)
+              Text(
+                _evToLabel(ev),
+                style: const TextStyle(fontSize: 10, color: Colors.white54),
+              ),
             Text(
-              note,
-              textAlign: TextAlign.center,
-              style: const TextStyle(fontSize: 10.5, color: Colors.white38),
+              params == null
+                  ? 'Waiting for a measurement'
+                  : 'Sensor ${params.summary}',
+              style: const TextStyle(fontSize: 10, color: Colors.white38),
             ),
+            const SizedBox(height: 6),
+            Row(
+              children: [
+                if (sample != null)
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 7,
+                      vertical: 3,
+                    ),
+                    decoration: BoxDecoration(
+                      color: Color.fromARGB(255, sample.r, sample.g, sample.b),
+                      borderRadius: BorderRadius.circular(6),
+                      border: Border.all(color: Colors.white24),
+                    ),
+                    child: Text(
+                      'R${sample.r} G${sample.g} B${sample.b}',
+                      style: TextStyle(
+                        fontSize: 10,
+                        fontWeight: FontWeight.w600,
+                        color: (sample.r + sample.g + sample.b) / 3 > 128
+                            ? Colors.black87
+                            : Colors.white,
+                      ),
+                    ),
+                  ),
+                const Spacer(),
+                InkWell(
+                  onTap: _openCalibration,
+                  borderRadius: BorderRadius.circular(6),
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 7,
+                      vertical: 3,
+                    ),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF1A1A1A),
+                      borderRadius: BorderRadius.circular(6),
+                      border: Border.all(color: Colors.white12),
+                    ),
+                    child: Text(
+                      'Cal ${_calibration >= 0 ? '+' : '−'}'
+                      '${_calibration.abs().toStringAsFixed(1)}',
+                      style: const TextStyle(
+                        fontSize: 10,
+                        color: Colors.white54,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            if (sample != null && params != null) ...[
+              const SizedBox(height: 3),
+              Text(
+                'Spot ${ExposureMath.formatStops(sample.stopsFromMiddleGrey)} '
+                'from mid-grey',
+                style: TextStyle(
+                  fontSize: 10,
+                  color: sample.isUsable
+                      ? Colors.white38
+                      : Colors.orangeAccent,
+                ),
+              ),
+            ],
           ],
+          const SizedBox(height: 6),
+          _buildExposureCompAxis(),
         ],
       ),
+    );
+  }
+
+  /// Horizontal EC axis: −3…+3 EV in 1-stop steps with the solved value.
+  Widget _buildExposureCompAxis() {
+    const comps = [-3, -2, -1, 0, 1, 2, 3];
+    final solvingLabel = _solvingShutter ? 'Shutter' : 'Aperture';
+    final exactAtZero =
+        _ev == null ? null : _valueAtCompensation(0, exact: true);
+
+    return Container(
+      padding: const EdgeInsets.fromLTRB(6, 6, 6, 4),
+      decoration: BoxDecoration(
+        color: const Color(0xFF121212),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: Colors.white12),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Row(
+            children: [
+              const Text(
+                'EC',
+                style: TextStyle(
+                  fontSize: 10,
+                  color: Colors.white54,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+              const Spacer(),
+              Text(
+                solvingLabel,
+                style: TextStyle(
+                  fontSize: 10,
+                  color: _accent.withValues(alpha: 0.85),
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 4),
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              for (final comp in comps)
+                Expanded(
+                  child: _compTick(
+                    compensation: comp,
+                    value: _valueAtCompensation(comp),
+                    exactValue: comp == 0 ? exactAtZero : null,
+                  ),
+                ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _compTick({
+    required int compensation,
+    required String value,
+    String? exactValue,
+  }) {
+    final isZero = compensation == 0;
+    final showExact =
+        isZero && exactValue != null && exactValue != '—' && exactValue != value;
+
+    return Column(
+      children: [
+        SizedBox(
+          height: 28,
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.end,
+            children: [
+              if (showExact)
+                Text(
+                  exactValue,
+                  textAlign: TextAlign.center,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: 9,
+                    fontWeight: FontWeight.w600,
+                    color: _accent.withValues(alpha: 0.75),
+                    height: 1.0,
+                  ),
+                ),
+              if (showExact) const SizedBox(height: 2),
+              Text(
+                value,
+                textAlign: TextAlign.center,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  fontSize: isZero ? 13 : 9.5,
+                  fontWeight: isZero ? FontWeight.w800 : FontWeight.w600,
+                  color: isZero ? _accent : Colors.white70,
+                  height: 1.0,
+                ),
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 3),
+        SizedBox(
+          height: 12,
+          child: Stack(
+            alignment: Alignment.center,
+            children: [
+              const Align(
+                alignment: Alignment.center,
+                child: Divider(
+                  height: 1,
+                  thickness: 1,
+                  color: Colors.white12,
+                ),
+              ),
+              Container(
+                width: isZero ? 2 : 1.5,
+                height: isZero ? 12 : 8,
+                color: isZero ? _accent : Colors.white38,
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 2),
+        Text(
+          _formatCompensation(compensation),
+          style: TextStyle(
+            fontSize: isZero ? 11 : 9.5,
+            fontWeight: isZero ? FontWeight.w800 : FontWeight.w600,
+            color: isZero ? _accent : Colors.white54,
+            height: 1.0,
+          ),
+        ),
+      ],
     );
   }
 
@@ -1392,56 +1539,57 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
   }) {
     return InkWell(
       onTap: onTap,
-      borderRadius: BorderRadius.circular(10),
+      borderRadius: BorderRadius.circular(8),
       child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
         decoration: BoxDecoration(
           color: emphasize
               ? const Color(0xFF221C0A)
               : const Color(0xFF1A1A1A),
-          borderRadius: BorderRadius.circular(10),
+          borderRadius: BorderRadius.circular(8),
           border: Border.all(
             color: emphasize ? const Color(0x55FFB300) : Colors.white12,
           ),
         ),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
+        child: Row(
           children: [
-            Text(
-              label,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              style: TextStyle(
-                fontSize: 11,
-                color: emphasize
-                    ? _accent.withValues(alpha: 0.8)
-                    : Colors.white54,
-              ),
-            ),
-            const SizedBox(height: 4),
-            Row(
-              children: [
-                Expanded(
-                  child: Text(
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    label,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      fontSize: 10,
+                      height: 1.1,
+                      color: emphasize
+                          ? _accent.withValues(alpha: 0.8)
+                          : Colors.white54,
+                    ),
+                  ),
+                  Text(
                     value,
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                     style: TextStyle(
-                      fontSize: emphasize ? 20 : 18,
+                      fontSize: emphasize ? 16 : 15,
                       fontWeight: FontWeight.w700,
+                      height: 1.15,
                       color: emphasize ? _accent : Colors.white,
-                      letterSpacing: emphasize ? -0.4 : 0,
+                      letterSpacing: emphasize ? -0.3 : 0,
                     ),
                   ),
-                ),
-                Icon(
-                  icon,
-                  color: emphasize
-                      ? _accent.withValues(alpha: 0.7)
-                      : Colors.white38,
-                  size: 18,
-                ),
-              ],
+                ],
+              ),
+            ),
+            Icon(
+              icon,
+              color: emphasize
+                  ? _accent.withValues(alpha: 0.7)
+                  : Colors.white38,
+              size: 16,
             ),
           ],
         ),
@@ -1599,50 +1747,75 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
   }
 }
 
-/// Draws the metered patch: a ring the size of the area actually sampled,
-/// plus a broken crosshair for precise aim.
-class _FocalTicksPainter extends CustomPainter {
-  final int count;
-  final Color color;
-
-  _FocalTicksPainter({required this.count, required this.color});
-
-  @override
-  void paint(Canvas canvas, Size size) {
-    if (count < 2) return;
-    final paint = Paint()
-      ..color = color
-      ..strokeWidth = 1;
-    for (var i = 0; i < count; i++) {
-      final t = i / (count - 1);
-      final y = t * size.height;
-      canvas.drawLine(
-        Offset(size.width * 0.35, y),
-        Offset(size.width * 0.65, y),
-        paint,
-      );
-    }
-  }
-
-  @override
-  bool shouldRepaint(covariant _FocalTicksPainter old) =>
-      count != old.count || color != old.color;
-}
-
 class _FilmFramePainter extends CustomPainter {
   final Color color;
   final bool showThirds;
 
-  _FilmFramePainter({required this.color, this.showThirds = true});
+  /// Optional FOV gate inside the viewfinder (e.g. 645 inside 6×6).
+  final double? gateWidthFrac;
+  final double? gateHeightFrac;
+
+  _FilmFramePainter({
+    required this.color,
+    this.showThirds = true,
+    this.gateWidthFrac,
+    this.gateHeightFrac,
+  });
 
   @override
   void paint(Canvas canvas, Size size) {
-    final rect = Offset.zero & size;
-    final border = Paint()
-      ..color = color.withValues(alpha: 0.85)
-      ..strokeWidth = 2
-      ..style = PaintingStyle.stroke;
-    canvas.drawRect(rect.deflate(1), border);
+    final outer = Offset.zero & size;
+    final hasGate = gateWidthFrac != null &&
+        gateHeightFrac != null &&
+        (gateWidthFrac! < 0.999 || gateHeightFrac! < 0.999);
+
+    late final Rect frame;
+    if (hasGate) {
+      final gw = size.width * gateWidthFrac!.clamp(0.05, 1.0);
+      final gh = size.height * gateHeightFrac!.clamp(0.05, 1.0);
+      frame = Rect.fromCenter(
+        center: Offset(size.width / 2, size.height / 2),
+        width: gw,
+        height: gh,
+      );
+
+      // Dim area outside the FOV gate.
+      final dim = Path()
+        ..addRect(outer)
+        ..addRect(frame)
+        ..fillType = PathFillType.evenOdd;
+      canvas.drawPath(
+        dim,
+        Paint()..color = Colors.black.withValues(alpha: 0.45),
+      );
+
+      // Quiet outer square edge.
+      canvas.drawRect(
+        outer.deflate(1),
+        Paint()
+          ..color = Colors.white24
+          ..strokeWidth = 1
+          ..style = PaintingStyle.stroke,
+      );
+
+      // Highlighted FOV border.
+      canvas.drawRect(
+        frame.deflate(0.5),
+        Paint()
+          ..color = color.withValues(alpha: 0.95)
+          ..strokeWidth = 2.5
+          ..style = PaintingStyle.stroke,
+      );
+    } else {
+      frame = outer.deflate(1);
+      canvas.drawRect(
+        frame,
+        Paint()
+          ..color = color.withValues(alpha: 0.85)
+          ..strokeWidth = 2
+          ..style = PaintingStyle.stroke,
+      );
+    }
 
     if (!showThirds) return;
 
@@ -1650,30 +1823,33 @@ class _FilmFramePainter extends CustomPainter {
       ..color = Colors.white24
       ..strokeWidth = 1;
     canvas.drawLine(
-      Offset(size.width / 3, 0),
-      Offset(size.width / 3, size.height),
+      Offset(frame.left + frame.width / 3, frame.top),
+      Offset(frame.left + frame.width / 3, frame.bottom),
       guide,
     );
     canvas.drawLine(
-      Offset(2 * size.width / 3, 0),
-      Offset(2 * size.width / 3, size.height),
+      Offset(frame.left + 2 * frame.width / 3, frame.top),
+      Offset(frame.left + 2 * frame.width / 3, frame.bottom),
       guide,
     );
     canvas.drawLine(
-      Offset(0, size.height / 3),
-      Offset(size.width, size.height / 3),
+      Offset(frame.left, frame.top + frame.height / 3),
+      Offset(frame.right, frame.top + frame.height / 3),
       guide,
     );
     canvas.drawLine(
-      Offset(0, 2 * size.height / 3),
-      Offset(size.width, 2 * size.height / 3),
+      Offset(frame.left, frame.top + 2 * frame.height / 3),
+      Offset(frame.right, frame.top + 2 * frame.height / 3),
       guide,
     );
   }
 
   @override
   bool shouldRepaint(covariant _FilmFramePainter old) =>
-      color != old.color || showThirds != old.showThirds;
+      color != old.color ||
+      showThirds != old.showThirds ||
+      gateWidthFrac != old.gateWidthFrac ||
+      gateHeightFrac != old.gateHeightFrac;
 }
 
 class _SpotPainter extends CustomPainter {

@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:isolate';
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 
@@ -26,15 +27,16 @@ class FilmFrameCaption {
   String get exposureLine => '$shutter  ·  $aperture  ·  ISO $iso';
 }
 
-/// Centre-crops [image] to [aspectRatio] (width÷height), then keeps
+/// Centre-crops pixel bounds to [aspectRatio] (width÷height), then keeps
 /// [fraction] of that frame (still centred) for a longer simulated focal length.
-ui.Rect filmSourceRect(
-  ui.Image image, {
+({int x, int y, int w, int h}) filmCropBounds({
+  required int width,
+  required int height,
   required double aspectRatio,
   required double fraction,
 }) {
-  final w = image.width.toDouble();
-  final h = image.height.toDouble();
+  final w = width.toDouble();
+  final h = height.toDouble();
   final aspect = aspectRatio <= 0 ? 1.0 : aspectRatio;
 
   late final double frameW;
@@ -50,27 +52,140 @@ ui.Rect filmSourceRect(
   final f = fraction.clamp(0.05, 1.0);
   final keptW = frameW * f;
   final keptH = frameH * f;
-  return ui.Rect.fromCenter(
-    center: ui.Offset(w / 2, h / 2),
-    width: keptW,
-    height: keptH,
+  final x = ((w - keptW) / 2).round().clamp(0, width - 1);
+  final y = ((h - keptH) / 2).round().clamp(0, height - 1);
+  final cw = keptW.round().clamp(1, width - x);
+  final ch = keptH.round().clamp(1, height - y);
+  return (x: x, y: y, w: cw, h: ch);
+}
+
+/// Centre-crops [image] to [aspectRatio] (width÷height), then keeps
+/// [fraction] of that frame (still centred) for a longer simulated focal length.
+ui.Rect filmSourceRect(
+  ui.Image image, {
+  required double aspectRatio,
+  required double fraction,
+}) {
+  final b = filmCropBounds(
+    width: image.width,
+    height: image.height,
+    aspectRatio: aspectRatio,
+    fraction: fraction,
+  );
+  return ui.Rect.fromLTWH(
+    b.x.toDouble(),
+    b.y.toDouble(),
+    b.w.toDouble(),
+    b.h.toDouble(),
   );
 }
 
-/// Wraps a captured JPEG in a film-style border with exposure info.
+/// Decode, orient, crop, and JPEG-encode on a background isolate (no Flutter UI).
+///
+/// Use this for album saves so the meter page stays responsive.
+Future<Uint8List> cropFilmJpegInBackground({
+  required Uint8List jpegBytes,
+  double? cropFraction,
+  double cropAspectRatio = 1.0,
+  double? insetWidthFrac,
+  double? insetHeightFrac,
+  int quality = 92,
+}) {
+  return Isolate.run(
+    () => _cropFilmJpegSync(
+      _CropJpegArgs(
+        jpegBytes: jpegBytes,
+        cropFraction: cropFraction,
+        cropAspectRatio: cropAspectRatio,
+        insetWidthFrac: insetWidthFrac,
+        insetHeightFrac: insetHeightFrac,
+        quality: quality,
+      ),
+    ),
+  );
+}
+
+class _CropJpegArgs {
+  const _CropJpegArgs({
+    required this.jpegBytes,
+    required this.cropFraction,
+    required this.cropAspectRatio,
+    required this.insetWidthFrac,
+    required this.insetHeightFrac,
+    required this.quality,
+  });
+
+  final Uint8List jpegBytes;
+  final double? cropFraction;
+  final double cropAspectRatio;
+  final double? insetWidthFrac;
+  final double? insetHeightFrac;
+  final int quality;
+}
+
+Uint8List _cropFilmJpegSync(_CropJpegArgs args) {
+  final decoded = img.decodeImage(args.jpegBytes);
+  if (decoded == null) {
+    throw const FormatException('Could not decode the captured image');
+  }
+  final upright = img.bakeOrientation(decoded);
+
+  img.Image out = upright;
+  final fraction = args.cropFraction;
+  if (fraction != null) {
+    final b = filmCropBounds(
+      width: upright.width,
+      height: upright.height,
+      aspectRatio: args.cropAspectRatio,
+      fraction: fraction,
+    );
+    out = img.copyCrop(
+      upright,
+      x: b.x,
+      y: b.y,
+      width: b.w,
+      height: b.h,
+    );
+  }
+
+  final iw = args.insetWidthFrac;
+  final ih = args.insetHeightFrac;
+  if (iw != null && ih != null && (iw < 0.999 || ih < 0.999)) {
+    final wFrac = iw.clamp(0.05, 1.0);
+    final hFrac = ih.clamp(0.05, 1.0);
+    final cw = (out.width * wFrac).round().clamp(1, out.width);
+    final ch = (out.height * hFrac).round().clamp(1, out.height);
+    final cx = ((out.width - cw) / 2).round().clamp(0, out.width - cw);
+    final cy = ((out.height - ch) / 2).round().clamp(0, out.height - ch);
+    out = img.copyCrop(out, x: cx, y: cy, width: cw, height: ch);
+  }
+
+  return Uint8List.fromList(img.encodeJpg(out, quality: args.quality));
+}
+
+/// Crops a capture to the film frame. When [printInfo] is true, wraps it in a
+/// film-style border with [caption]; otherwise returns only the cropped photo
+/// (processed on a background isolate).
 ///
 /// Orientation is baked from EXIF first so a portrait phone shot stays upright
 /// when drawn without an EXIF tag. When [cropFraction] is set, the photo is
 /// first reduced to [cropAspectRatio] and then to that fraction of the frame,
 /// matching a focal-length simulation on that film format.
-///
-/// Returns a high-quality JPEG at the full capture resolution (plus border).
-Future<Uint8List> stampFilmFrame({
+Future<Uint8List> exportFilmFrame({
   required Uint8List jpegBytes,
   required FilmFrameCaption caption,
   double? cropFraction,
   double cropAspectRatio = 1.0,
+  bool printInfo = true,
 }) async {
+  if (!printInfo) {
+    return cropFilmJpegInBackground(
+      jpegBytes: jpegBytes,
+      cropFraction: cropFraction,
+      cropAspectRatio: cropAspectRatio,
+    );
+  }
+
   final photo = await _orientedUiImage(jpegBytes);
 
   try {
@@ -211,6 +326,22 @@ Future<Uint8List> stampFilmFrame({
   } finally {
     photo.dispose();
   }
+}
+
+/// Legacy wrapper — stamps exposure info onto the film border.
+Future<Uint8List> stampFilmFrame({
+  required Uint8List jpegBytes,
+  required FilmFrameCaption caption,
+  double? cropFraction,
+  double cropAspectRatio = 1.0,
+}) {
+  return exportFilmFrame(
+    jpegBytes: jpegBytes,
+    caption: caption,
+    cropFraction: cropFraction,
+    cropAspectRatio: cropAspectRatio,
+    printInfo: true,
+  );
 }
 
 /// Decodes a capture, applies EXIF orientation, and uploads pixels to the GPU
