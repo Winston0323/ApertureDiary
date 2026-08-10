@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import 'exposure.dart';
 import 'flash.dart';
+import 'flash_prefs.dart';
 import 'flash_scale.dart';
 import 'number_input_dialog.dart';
 import 'units.dart';
@@ -16,6 +17,7 @@ class FlashPage extends StatefulWidget {
     required this.iso,
     required this.aperture,
     this.ambientEv,
+    this.initialDistance,
   });
 
   final int iso;
@@ -24,6 +26,9 @@ class FlashPage extends StatefulWidget {
   /// Ambient EV₁₀₀ from the meter, if a reading exists. Used only for the
   /// "ambient alone needs …" sync-speed note.
   final double? ambientEv;
+
+  /// Last measured subject distance from the meter (metres), if any.
+  final double? initialDistance;
 
   @override
   State<FlashPage> createState() => _FlashPageState();
@@ -35,9 +40,27 @@ class _FlashPageState extends State<FlashPage> {
   late double _aperture = widget.aperture;
 
   /// Guide number at ISO 100 and flash-to-subject distance, both in metres.
-  double _guideNumber = 36.0;
-  double _distance = 3.0;
+  double _guideNumber = FlashPrefsStore.defaultGuideNumber;
+  late double _distance = _initialDistanceOrDefault();
   bool _useFeet = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadGuideNumber();
+  }
+
+  Future<void> _loadGuideNumber() async {
+    final gn = await FlashPrefsStore.loadGuideNumber();
+    if (!mounted) return;
+    setState(() => _guideNumber = gn);
+  }
+
+  double _initialDistanceOrDefault() {
+    final d = widget.initialDistance;
+    if (d != null && d.isFinite && d > 0.2 && d < 40) return d;
+    return 3.0;
+  }
 
   double _convertLength(double metres) =>
       convertLength(metres, useFeet: _useFeet);
@@ -151,9 +174,9 @@ class _FlashPageState extends State<FlashPage> {
       highest: 300,
     );
     if (entered == null) return;
-    setState(() {
-      _guideNumber = toMetres(entered, useFeet: _useFeet);
-    });
+    final gn = toMetres(entered, useFeet: _useFeet);
+    setState(() => _guideNumber = gn);
+    await FlashPrefsStore.saveGuideNumber(gn);
   }
 
   Future<void> _promptDistance() async {

@@ -3,11 +3,14 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 
 import 'album_shot.dart';
+import 'app_backup.dart';
+import 'camera_picker.dart';
 import 'edit_film_sheet.dart';
 import 'film_format.dart';
 import 'film_icon.dart';
 import 'film_page.dart';
 import 'film_stock.dart';
+import 'gear_page.dart';
 
 const Color _accent = Color(0xFFFFB300);
 
@@ -15,7 +18,7 @@ const Color _accent = Color(0xFFFFB300);
 class HomePage extends StatefulWidget {
   const HomePage({super.key, required this.onOpenMeter});
 
-  final void Function(FilmStock film) onOpenMeter;
+  final Future<void> Function(FilmStock film) onOpenMeter;
 
   @override
   State<HomePage> createState() => _HomePageState();
@@ -62,6 +65,7 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<void> _load() async {
+    final restored = await AppDataBackup.restoreFromMirrorIfEmpty();
     final films = await FilmStockStore.loadSelected();
     final shots = await AlbumShotStore.load();
     if (!mounted) return;
@@ -70,6 +74,54 @@ class _HomePageState extends State<HomePage> {
       _shots = shots;
       _loading = false;
     });
+    if (restored && mounted) {
+      final messenger = ScaffoldMessenger.maybeOf(context);
+      messenger?.showSnackBar(
+        const SnackBar(
+          content: Text('Restored films & gear from backup'),
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
+    }
+  }
+
+  Future<void> _exportBackup() async {
+    final path = await AppDataBackup.exportBackup();
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+          path != null
+              ? 'Backup saved to Downloads/ApertureDiary'
+              : 'Could not write backup',
+        ),
+        behavior: SnackBarBehavior.floating,
+      ),
+    );
+  }
+
+  Future<void> _importBackup() async {
+    final ok = await AppDataBackup.restoreFromMirror();
+    if (!mounted) return;
+    if (ok) {
+      await _load();
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Backup restored'),
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
+    } else {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'No backup found in Downloads/ApertureDiary',
+          ),
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
+    }
   }
 
   Future<void> _loadShots() async {
@@ -160,8 +212,20 @@ class _HomePageState extends State<HomePage> {
 
   Future<void> _openSelectFilm() async {
     _exitEditMode();
+
+    // Camera first, then film catalog filtered to that body.
+    final cameraPick = await showCameraPicker(
+      context,
+      title: 'Which camera?',
+      subtitle: 'Then pick the film for this body',
+      allowNone: true,
+    );
+    if (cameraPick == null || !mounted) return;
+
     final selected = await Navigator.of(context).push<FilmStock>(
-      MaterialPageRoute(builder: (_) => const FilmSelectPage()),
+      MaterialPageRoute(
+        builder: (_) => FilmSelectPage(cameraPick: cameraPick),
+      ),
     );
     if (selected == null || !mounted) return;
 
@@ -228,12 +292,23 @@ class _HomePageState extends State<HomePage> {
     await FilmStockStore.saveSelected(_films);
   }
 
-  void _onFilmTap(FilmStock film) {
-    if (!_editMode) {
-      widget.onOpenMeter(film);
+  Future<void> _onFilmTap(FilmStock film) async {
+    if (_editMode) {
+      _toggleFilmSelected(film);
       return;
     }
-    _toggleFilmSelected(film);
+    // Reload from disk so lens/camera choices from the last meter session stick.
+    final saved = await FilmStockStore.loadSelected();
+    FilmStock latest = film;
+    for (final f in saved) {
+      if (f.id == film.id) {
+        latest = f;
+        break;
+      }
+    }
+    if (!mounted) return;
+    await widget.onOpenMeter(latest);
+    if (mounted) await _load();
   }
 
   @override
@@ -264,7 +339,40 @@ class _HomePageState extends State<HomePage> {
                     fontWeight: FontWeight.w800,
                   ),
                 ),
+              )
+            else ...[
+              PopupMenuButton<String>(
+                tooltip: 'Backup',
+                icon: const Icon(Icons.more_vert, color: Colors.white70),
+                color: const Color(0xFF1A1A1A),
+                onSelected: (value) {
+                  if (value == 'export') {
+                    _exportBackup();
+                  } else if (value == 'import') {
+                    _importBackup();
+                  }
+                },
+                itemBuilder: (context) => const [
+                  PopupMenuItem(
+                    value: 'export',
+                    child: Text('Save backup'),
+                  ),
+                  PopupMenuItem(
+                    value: 'import',
+                    child: Text('Restore backup'),
+                  ),
+                ],
               ),
+              IconButton(
+                tooltip: 'Cameras',
+                onPressed: () {
+                  Navigator.of(context).push(
+                    MaterialPageRoute(builder: (_) => const GearPage()),
+                  );
+                },
+                icon: const Icon(Icons.add_a_photo_outlined),
+              ),
+            ],
           ],
         ),
         floatingActionButton: _editMode
@@ -639,6 +747,19 @@ class _TimelineFilmTile extends StatelessWidget {
                                       fontSize: 12,
                                     ),
                                   ),
+                                  if (film.cameraLabel != null &&
+                                      film.cameraLabel!.isNotEmpty) ...[
+                                    const SizedBox(height: 2),
+                                    Text(
+                                      film.cameraLabel!,
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: const TextStyle(
+                                        color: Colors.white38,
+                                        fontSize: 12,
+                                      ),
+                                    ),
+                                  ],
                                   if (previews.isNotEmpty) ...[
                                     const SizedBox(height: 10),
                                     SizedBox(

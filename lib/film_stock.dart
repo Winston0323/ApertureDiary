@@ -4,12 +4,14 @@ import 'dart:ui' show Color;
 
 import 'package:path_provider/path_provider.dart';
 
+import 'app_backup.dart';
 import 'film_format.dart';
 
-/// Roll size: 135 (35 mm) or 120 (medium format).
+/// Roll size: 135, 120, or Instax pack film.
 enum FilmType {
   thirtyFive('135'),
-  oneTwenty('120');
+  oneTwenty('120'),
+  instax('Instax');
 
   const FilmType(this.label);
   final String label;
@@ -29,6 +31,8 @@ enum FilmType {
         return const [FilmFormat.thirtyFive];
       case FilmType.oneTwenty:
         return const [FilmFormat.sixFourFive, FilmFormat.sixBySix];
+      case FilmType.instax:
+        return FilmFormat.instaxFormats;
     }
   }
 
@@ -38,7 +42,38 @@ enum FilmType {
         return FilmFormat.thirtyFive;
       case FilmType.oneTwenty:
         return FilmFormat.sixBySix;
+      case FilmType.instax:
+        return FilmFormat.instaxMini;
     }
+  }
+}
+
+/// Colour balance of the emulsion (affects meter EI under daylight).
+enum FilmBalance {
+  daylight('Daylight'),
+  tungsten('Tungsten');
+
+  const FilmBalance(this.label);
+  final String label;
+
+  static FilmBalance? fromName(String? name) {
+    if (name == null) return null;
+    for (final b in values) {
+      if (b.name == name || b.label == name) return b;
+    }
+    return null;
+  }
+
+  /// Infer from stock name / key (`500T`, `800T`, …).
+  static FilmBalance infer({String? name, String? iconKey}) {
+    final hay = '${name ?? ''} ${iconKey ?? ''}'.toLowerCase();
+    // Word-boundary style: "500t", "800t", " tungsten", trailing " t ".
+    if (RegExp(r'(^|[^a-z])\d{2,4}t([^a-z]|$)').hasMatch(hay) ||
+        hay.contains('tungsten') ||
+        hay.contains(' tungsten')) {
+      return FilmBalance.tungsten;
+    }
+    return FilmBalance.daylight;
   }
 }
 
@@ -98,7 +133,8 @@ enum FilmBrand {
         hay.contains('provia') ||
         hay.contains('acros') ||
         hay.contains('superia') ||
-        hay.contains('neopan')) {
+        hay.contains('neopan') ||
+        hay.contains('instax')) {
       return FilmBrand.fujifilm;
     }
     if (hay.contains('ilford') ||
@@ -124,10 +160,18 @@ class FilmStock {
     FilmFormat? frameFormat,
     this.brand = FilmBrand.other,
     this.category,
+    FilmBalance? balance,
     this.isCustom = false,
     this.iconKey,
     this.addedAt,
-  }) : frameFormat = normalizeFrameFormat(type, frameFormat);
+    this.cameraId,
+    this.cameraLabel,
+    this.lensId,
+    this.lensLabel,
+    this.meterDaylight85 = false,
+  })  : frameFormat = normalizeFrameFormat(type, frameFormat),
+        balance = balance ??
+            FilmBalance.infer(name: name, iconKey: iconKey);
 
   final String id;
   final String name;
@@ -141,6 +185,10 @@ class FilmStock {
   final int iso;
   final FilmBrand brand;
   final FilmCategory? category;
+
+  /// Daylight vs tungsten colour balance of the emulsion.
+  final FilmBalance balance;
+
   final bool isCustom;
 
   /// Asset key under `assets/films/` (without extension), if any.
@@ -149,12 +197,30 @@ class FilmStock {
   /// When this roll was added to the home timeline.
   final DateTime? addedAt;
 
+  /// [UserCamera.id] this roll is loaded in, if chosen.
+  final String? cameraId;
+
+  /// Display snapshot e.g. `Hasselblad 500CM` (kept if the body is deleted).
+  final String? cameraLabel;
+
+  /// [UserLens.id] currently mounted for metering, if chosen.
+  final String? lensId;
+
+  /// Display snapshot e.g. `Hasselblad Planar 80`.
+  final String? lensLabel;
+
+  /// For tungsten stocks: meter at daylight EI with an 85 filter (−⅔ stop).
+  final bool meterDaylight85;
+
+  bool get isTungsten => balance == FilmBalance.tungsten;
+
   String? get iconAsset =>
       iconKey == null ? null : 'assets/films/$iconKey.png';
 
-  /// Timeline / meter badge: `135`, or `645` / `6×6` for medium format.
+  /// Timeline / meter badge: `135`, `645` / `6×6`, or Instax `Mini` / `SQ`.
   String get rollFormatLabel {
     if (type == FilmType.thirtyFive) return type.label;
+    if (type == FilmType.instax) return 'Instax ${frameFormat.label}';
     return frameFormat.label;
   }
 
@@ -171,7 +237,18 @@ class FilmStock {
           return format!;
         }
         return FilmFormat.sixBySix;
+      case FilmType.instax:
+        if (format == FilmFormat.instaxMini ||
+            format == FilmFormat.instaxSquare) {
+          return format!;
+        }
+        return FilmFormat.instaxMini;
     }
+  }
+
+  static bool looksLikeInstax({String? name, String? iconKey}) {
+    final hay = '${name ?? ''} ${iconKey ?? ''}'.toLowerCase();
+    return hay.contains('instax');
   }
 
   /// Sort key for the home timeline (newest first). Falls back to the roll id.
@@ -195,9 +272,17 @@ class FilmStock {
     int? iso,
     FilmBrand? brand,
     FilmCategory? category,
+    FilmBalance? balance,
     bool? isCustom,
     String? iconKey,
     DateTime? addedAt,
+    String? cameraId,
+    String? cameraLabel,
+    String? lensId,
+    String? lensLabel,
+    bool? meterDaylight85,
+    bool clearCamera = false,
+    bool clearLens = false,
   }) {
     final nextType = type ?? this.type;
     return FilmStock(
@@ -208,9 +293,15 @@ class FilmStock {
       iso: iso ?? this.iso,
       brand: brand ?? this.brand,
       category: category ?? this.category,
+      balance: balance ?? this.balance,
       isCustom: isCustom ?? this.isCustom,
       iconKey: iconKey ?? this.iconKey,
       addedAt: addedAt ?? this.addedAt,
+      cameraId: clearCamera ? null : (cameraId ?? this.cameraId),
+      cameraLabel: clearCamera ? null : (cameraLabel ?? this.cameraLabel),
+      lensId: clearLens ? null : (lensId ?? this.lensId),
+      lensLabel: clearLens ? null : (lensLabel ?? this.lensLabel),
+      meterDaylight85: meterDaylight85 ?? this.meterDaylight85,
     );
   }
 
@@ -225,9 +316,15 @@ class FilmStock {
       iso: iso,
       brand: brand,
       category: category,
+      balance: balance,
       isCustom: isCustom,
       iconKey: iconKey,
       addedAt: now,
+      cameraId: cameraId,
+      cameraLabel: cameraLabel,
+      lensId: lensId,
+      lensLabel: lensLabel,
+      meterDaylight85: meterDaylight85,
     );
   }
 
@@ -238,16 +335,22 @@ class FilmStock {
         'frameFormat': frameFormat.id,
         'iso': iso,
         'brand': brand.name,
+        'balance': balance.name,
         'isCustom': isCustom,
+        'meterDaylight85': meterDaylight85,
         if (category != null) 'category': category!.name,
         if (iconKey != null) 'iconKey': iconKey,
         if (addedAt != null) 'addedAt': addedAt!.toIso8601String(),
+        if (cameraId != null) 'cameraId': cameraId,
+        if (cameraLabel != null) 'cameraLabel': cameraLabel,
+        if (lensId != null) 'lensId': lensId,
+        if (lensLabel != null) 'lensLabel': lensLabel,
       };
 
   static FilmStock? fromJson(Map<String, dynamic> json) {
     final id = json['id'];
     final name = json['name'];
-    final type = FilmType.fromLabel(json['type'] as String?);
+    var type = FilmType.fromLabel(json['type'] as String?);
     final iso = json['iso'];
     if (id is! String || name is! String || type == null || iso is! num) {
       return null;
@@ -260,7 +363,24 @@ class FilmStock {
     }
     final brand = FilmBrand.fromLabel(json['brand'] as String?) ??
         FilmBrand.infer(name: name, iconKey: iconKey);
-    final frameFormat = FilmFormat.byId(json['frameFormat'] as String?);
+    var frameFormat = FilmFormat.byId(json['frameFormat'] as String?);
+    // Older Instax rolls were saved as 120 + 645/6×6 — migrate.
+    if (looksLikeInstax(name: name, iconKey: iconKey) &&
+        type != FilmType.instax) {
+      type = FilmType.instax;
+      if (frameFormat == null || !frameFormat.isInstax) {
+        frameFormat = frameFormat == FilmFormat.sixBySix
+            ? FilmFormat.instaxSquare
+            : FilmFormat.instaxMini;
+      }
+    }
+    final cameraId =
+        json['cameraId'] is String ? json['cameraId'] as String : null;
+    final cameraLabel =
+        json['cameraLabel'] is String ? json['cameraLabel'] as String : null;
+    final lensId = json['lensId'] is String ? json['lensId'] as String : null;
+    final lensLabel =
+        json['lensLabel'] is String ? json['lensLabel'] as String : null;
     return FilmStock(
       id: id,
       name: name,
@@ -269,9 +389,16 @@ class FilmStock {
       iso: iso.toInt(),
       brand: brand,
       category: FilmCategory.fromLabel(json['category'] as String?),
+      balance: FilmBalance.fromName(json['balance'] as String?) ??
+          FilmBalance.infer(name: name, iconKey: iconKey),
       isCustom: json['isCustom'] == true,
       iconKey: iconKey,
       addedAt: addedAt,
+      cameraId: cameraId,
+      cameraLabel: cameraLabel,
+      lensId: lensId,
+      lensLabel: lensLabel,
+      meterDaylight85: json['meterDaylight85'] == true,
     );
   }
 }
@@ -285,6 +412,8 @@ class FilmCatalogEntry {
     required this.formats,
     required this.category,
     required this.brand,
+    this.balance,
+    this.motionPicture = false,
   });
 
   final String iconKey;
@@ -294,11 +423,26 @@ class FilmCatalogEntry {
   final FilmCategory category;
   final FilmBrand brand;
 
+  /// Explicit colour balance; inferred from name/key when null.
+  final FilmBalance? balance;
+
+  /// Cinema / aerial camera stocks (shown under the Movie brand chip).
+  final bool motionPicture;
+
+  FilmBalance get resolvedBalance =>
+      balance ?? FilmBalance.infer(name: name, iconKey: iconKey);
+
   String get iconAsset => 'assets/films/$iconKey.png';
 
   bool offers(FilmType type) => formats.contains(type);
 
-  String get formatsLabel => formats.map((f) => f.label).join(' · ');
+  bool get isInstax => formats.contains(FilmType.instax);
+
+  String get formatsLabel =>
+      isInstax ? 'Mini · SQ' : formats.map((f) => f.label).join(' · ');
+
+  /// List section label: Movie stocks are grouped apart from still brands.
+  String get brandGroupLabel => motionPicture ? 'Movie' : brand.label;
 
   FilmStock toStock(FilmType type, {FilmFormat? frameFormat}) {
     assert(offers(type));
@@ -311,6 +455,7 @@ class FilmCatalogEntry {
       iso: iso,
       brand: brand,
       category: category,
+      balance: resolvedBalance,
       iconKey: iconKey,
     );
   }
@@ -322,6 +467,7 @@ class PopularFilms {
 
   static const _both = [FilmType.thirtyFive, FilmType.oneTwenty];
   static const _only135 = [FilmType.thirtyFive];
+  static const _onlyInstax = [FilmType.instax];
 
   static const List<FilmCatalogEntry> catalog = [
     // —— Color negative ——
@@ -380,6 +526,7 @@ class PopularFilms {
       formats: _only135,
       category: FilmCategory.colorNegative,
       brand: FilmBrand.cinestill,
+      balance: FilmBalance.tungsten,
     ),
     FilmCatalogEntry(
       iconKey: 'fuji-pro-400h',
@@ -412,6 +559,51 @@ class PopularFilms {
       formats: _only135,
       category: FilmCategory.colorNegative,
       brand: FilmBrand.fujifilm,
+    ),
+    FilmCatalogEntry(
+      iconKey: 'fuji-instax-800',
+      name: 'Fujifilm Instax',
+      iso: 800,
+      formats: _onlyInstax,
+      category: FilmCategory.colorNegative,
+      brand: FilmBrand.fujifilm,
+    ),
+    FilmCatalogEntry(
+      iconKey: 'kodak-vision3-250d',
+      name: 'Kodak Vision3 250D (5207)',
+      iso: 250,
+      formats: _both,
+      category: FilmCategory.colorNegative,
+      brand: FilmBrand.kodak,
+      motionPicture: true,
+    ),
+    FilmCatalogEntry(
+      iconKey: 'kodak-vision3-500t',
+      name: 'Kodak Vision3 500T (5219)',
+      iso: 500,
+      formats: _both,
+      category: FilmCategory.colorNegative,
+      brand: FilmBrand.kodak,
+      balance: FilmBalance.tungsten,
+      motionPicture: true,
+    ),
+    FilmCatalogEntry(
+      iconKey: 'kodak-vision3-50d',
+      name: 'Kodak Vision3 50D (5203)',
+      iso: 50,
+      formats: _both,
+      category: FilmCategory.colorNegative,
+      brand: FilmBrand.kodak,
+      motionPicture: true,
+    ),
+    FilmCatalogEntry(
+      iconKey: 'kodak-aerocolor-2460',
+      name: 'Kodak Aerocolor IV (2460)',
+      iso: 100,
+      formats: _both,
+      category: FilmCategory.colorNegative,
+      brand: FilmBrand.kodak,
+      motionPicture: true,
     ),
     // —— Black & white ——
     FilmCatalogEntry(
@@ -488,6 +680,15 @@ class PopularFilms {
       brand: FilmBrand.kodak,
     ),
     FilmCatalogEntry(
+      iconKey: 'kodak-ektachrome-100d-5294',
+      name: 'Kodak Ektachrome 100D (5294)',
+      iso: 100,
+      formats: _only135,
+      category: FilmCategory.colorSlide,
+      brand: FilmBrand.kodak,
+      motionPicture: true,
+    ),
+    FilmCatalogEntry(
       iconKey: 'fuji-velvia-50',
       name: 'Fujichrome Velvia 50',
       iso: 50,
@@ -557,8 +758,20 @@ class FilmStockStore {
       await file.writeAsString(
         jsonEncode(ordered.map((f) => f.toJson()).toList()),
       );
+      await AppDataBackup.writeMirror();
     } catch (_) {
       // Ignore write failures.
     }
+  }
+
+  static Future<void> upsertSelected(FilmStock film) async {
+    final list = [...await loadSelected()];
+    final i = list.indexWhere((f) => f.id == film.id);
+    if (i >= 0) {
+      list[i] = film;
+    } else {
+      list.insert(0, film);
+    }
+    await saveSelected(list);
   }
 }

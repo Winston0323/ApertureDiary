@@ -185,6 +185,8 @@ class _AddFilmPageState extends State<AddFilmPage> {
                 Expanded(child: _typeChip(FilmType.thirtyFive)),
                 const SizedBox(width: 10),
                 Expanded(child: _typeChip(FilmType.oneTwenty)),
+                const SizedBox(width: 10),
+                Expanded(child: _typeChip(FilmType.instax)),
               ],
             ),
             if (_type == FilmType.oneTwenty) ...[
@@ -203,6 +205,25 @@ class _AddFilmPageState extends State<AddFilmPage> {
                   Expanded(child: _frameChip(FilmFormat.sixFourFive)),
                   const SizedBox(width: 10),
                   Expanded(child: _frameChip(FilmFormat.sixBySix)),
+                ],
+              ),
+            ],
+            if (_type == FilmType.instax) ...[
+              const SizedBox(height: 20),
+              const Text(
+                'Instax size',
+                style: TextStyle(
+                  fontSize: 13,
+                  fontWeight: FontWeight.w600,
+                  color: Colors.white70,
+                ),
+              ),
+              const SizedBox(height: 8),
+              Row(
+                children: [
+                  Expanded(child: _frameChip(FilmFormat.instaxMini)),
+                  const SizedBox(width: 10),
+                  Expanded(child: _frameChip(FilmFormat.instaxSquare)),
                 ],
               ),
             ],
@@ -311,6 +332,10 @@ class _AddFilmPageState extends State<AddFilmPage> {
         _type = type;
         if (type == FilmType.thirtyFive) {
           _frameFormat = FilmFormat.thirtyFive;
+        } else if (type == FilmType.instax) {
+          if (!_frameFormat.isInstax) {
+            _frameFormat = FilmFormat.instaxMini;
+          }
         } else if (_frameFormat != FilmFormat.sixFourFive &&
             _frameFormat != FilmFormat.sixBySix) {
           _frameFormat = FilmFormat.sixBySix;

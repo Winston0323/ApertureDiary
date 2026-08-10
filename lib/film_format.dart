@@ -62,7 +62,38 @@ class FilmFormat {
     defaultFocalMm: 80,
   );
 
-  static const List<FilmFormat> all = [thirtyFive, sixFourFive, sixBySix];
+  /// Fujifilm Instax Mini — image area 62×46 mm (sheet 86×54).
+  static const FilmFormat instaxMini = FilmFormat(
+    id: 'instax-mini',
+    label: 'Mini',
+    widthMm: 62,
+    heightMm: 46,
+    standardLensesMm: [60],
+    defaultFocalMm: 60,
+  );
+
+  /// Fujifilm Instax Square — image area 62×62 mm (sheet 86×72).
+  static const FilmFormat instaxSquare = FilmFormat(
+    id: 'instax-sq',
+    label: 'SQ',
+    widthMm: 62,
+    heightMm: 62,
+    standardLensesMm: [66],
+    defaultFocalMm: 66,
+  );
+
+  static const List<FilmFormat> all = [
+    thirtyFive,
+    sixFourFive,
+    sixBySix,
+    instaxMini,
+    instaxSquare,
+  ];
+
+  static const List<FilmFormat> instaxFormats = [instaxMini, instaxSquare];
+
+  bool get isInstax =>
+      id == instaxMini.id || id == instaxSquare.id;
 
   static FilmFormat? byId(String? id) {
     if (id == null) return null;

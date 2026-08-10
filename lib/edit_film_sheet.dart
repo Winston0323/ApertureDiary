@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import 'camera_picker.dart';
 import 'film_format.dart';
 import 'film_stock.dart';
 
@@ -36,6 +37,8 @@ class _EditFilmSheetState extends State<_EditFilmSheet> {
   late FilmType _type;
   late FilmFormat _frameFormat;
   late DateTime _when;
+  String? _cameraId;
+  String? _cameraLabel;
 
   @override
   void initState() {
@@ -44,6 +47,8 @@ class _EditFilmSheetState extends State<_EditFilmSheet> {
     _type = widget.film.type;
     _frameFormat = widget.film.frameFormat;
     _when = widget.film.timelineAt.toLocal();
+    _cameraId = widget.film.cameraId;
+    _cameraLabel = widget.film.cameraLabel;
   }
 
   @override
@@ -114,6 +119,27 @@ class _EditFilmSheetState extends State<_EditFilmSheet> {
     });
   }
 
+  Future<void> _pickCamera() async {
+    final pick = await showCameraPicker(
+      context,
+      title: 'Which camera?',
+      subtitle: widget.film.name,
+      type: _type,
+      frameFormat: _frameFormat,
+      selectedCameraId: _cameraId,
+    );
+    if (pick == null || !mounted) return;
+    setState(() {
+      if (pick.camera == null) {
+        _cameraId = null;
+        _cameraLabel = null;
+      } else {
+        _cameraId = pick.camera!.id;
+        _cameraLabel = cameraDisplayName(pick.camera!);
+      }
+    });
+  }
+
   void _save() {
     final name = _nameController.text.trim();
     if (name.isEmpty) {
@@ -128,6 +154,9 @@ class _EditFilmSheetState extends State<_EditFilmSheet> {
         type: _type,
         frameFormat: _frameFormat,
         addedAt: _when,
+        cameraId: _cameraId,
+        cameraLabel: _cameraLabel,
+        clearCamera: _cameraId == null,
       ),
     );
   }
@@ -229,6 +258,8 @@ class _EditFilmSheetState extends State<_EditFilmSheet> {
               Expanded(child: _typeChip(FilmType.thirtyFive)),
               const SizedBox(width: 10),
               Expanded(child: _typeChip(FilmType.oneTwenty)),
+              const SizedBox(width: 10),
+              Expanded(child: _typeChip(FilmType.instax)),
             ],
           ),
           if (_type == FilmType.oneTwenty) ...[
@@ -250,6 +281,41 @@ class _EditFilmSheetState extends State<_EditFilmSheet> {
               ],
             ),
           ],
+          if (_type == FilmType.instax) ...[
+            const SizedBox(height: 16),
+            const Text(
+              'Instax size',
+              style: TextStyle(
+                fontSize: 13,
+                fontWeight: FontWeight.w600,
+                color: Colors.white70,
+              ),
+            ),
+            const SizedBox(height: 8),
+            Row(
+              children: [
+                Expanded(child: _frameChip(FilmFormat.instaxMini)),
+                const SizedBox(width: 10),
+                Expanded(child: _frameChip(FilmFormat.instaxSquare)),
+              ],
+            ),
+          ],
+          const SizedBox(height: 16),
+          const Text(
+            'Camera',
+            style: TextStyle(
+              fontSize: 13,
+              fontWeight: FontWeight.w600,
+              color: Colors.white70,
+            ),
+          ),
+          const SizedBox(height: 8),
+          _pickerButton(
+            label: _cameraLabel ?? 'Select camera',
+            icon: Icons.camera_alt_outlined,
+            onTap: _pickCamera,
+            muted: _cameraLabel == null,
+          ),
           const SizedBox(height: 16),
           const Text(
             'Time',
@@ -292,6 +358,10 @@ class _EditFilmSheetState extends State<_EditFilmSheet> {
         _type = type;
         if (type == FilmType.thirtyFive) {
           _frameFormat = FilmFormat.thirtyFive;
+        } else if (type == FilmType.instax) {
+          if (!_frameFormat.isInstax) {
+            _frameFormat = FilmFormat.instaxMini;
+          }
         } else if (_frameFormat != FilmFormat.sixFourFive &&
             _frameFormat != FilmFormat.sixBySix) {
           _frameFormat = FilmFormat.sixBySix;
@@ -347,6 +417,7 @@ class _EditFilmSheetState extends State<_EditFilmSheet> {
     required String label,
     required IconData icon,
     required VoidCallback onTap,
+    bool muted = false,
   }) {
     return Material(
       color: const Color(0xFF1A1A1A),
@@ -370,13 +441,14 @@ class _EditFilmSheetState extends State<_EditFilmSheet> {
                   label,
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(
-                    color: Colors.white,
+                  style: TextStyle(
+                    color: muted ? Colors.white38 : Colors.white,
                     fontWeight: FontWeight.w600,
                     fontSize: 14,
                   ),
                 ),
               ),
+              const Icon(Icons.expand_more, color: Colors.white38, size: 20),
             ],
           ),
         ),

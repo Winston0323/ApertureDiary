@@ -11,14 +11,18 @@ import 'package:flutter/services.dart';
 import 'album_page.dart';
 import 'album_shot.dart';
 import 'calibration.dart';
+import 'distance_estimator.dart';
 import 'exposure.dart';
 import 'film_format.dart';
 import 'film_frame.dart';
 import 'film_stock.dart';
 import 'flash_page.dart';
+import 'focal_arc_dial.dart';
+import 'gear.dart';
 import 'home_page.dart';
 import 'lens_info.dart';
 import 'metering.dart';
+import 'units.dart';
 import 'wheel_dial.dart';
 
 Future<void> main() async {
@@ -46,6 +50,9 @@ Future<void> main() async {
 }
 
 const Color _accent = Color(0xFFFFB300);
+
+/// Sentinel returned by the focal picker for the free-zoom option.
+const Object _freeZoomChoice = Object();
 
 final ThemeData _darkTheme = ThemeData(
   brightness: Brightness.dark,
@@ -91,8 +98,8 @@ class ApertureDiaryApp extends StatelessWidget {
       theme: _darkTheme,
       home: Builder(
         builder: (context) => HomePage(
-          onOpenMeter: (film) {
-            Navigator.of(context).push(
+          onOpenMeter: (film) async {
+            await Navigator.of(context).push(
               MaterialPageRoute<void>(
                 builder: (_) => ApertureDiaryPage(
                   camera: camera,
@@ -139,14 +146,28 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
 
   ExposureParams? _params;
   SpotSample? _sample;
+
+  /// Scene brightness as EV₁₀₀ (ISO-normalized). Display uses Hasselblad
+  /// lens EV via [_lensEv].
   double? _ev;
   double _calibration = 0.0;
+
+  /// Hasselblad / Compur orange-scale EV at the current metering EI.
+  double? get _lensEv {
+    final ev100 = _ev;
+    if (ev100 == null) return null;
+    return ExposureMath.lensEvFromEv100(ev100: ev100, iso: _meterIso);
+  }
 
   /// RGB / calibration row; collapsed unless the user expands it.
   bool _meterDetailsOpen = false;
 
   bool _measuring = false;
   bool _saving = false;
+  /// Inline status to the left of the shutter (replaces save SnackBars).
+  String? _captureHint;
+  bool _captureHintError = false;
+  Timer? _captureHintTimer;
   String _status = 'Starting camera…';
   DateTime? _lastMeasuredAt;
   int _failedMeasurements = 0;
@@ -164,17 +185,119 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
   double _minZoom = 1.0;
   double _maxZoom = 1.0;
 
+  /// Point-first subject distance (IMU + track). Null when idle.
+  DistanceEstimator? _distanceEstimator;
+  DistanceEstimate? _distanceEstimate;
+  double? _subjectDistanceM;
+  bool _distanceStartPending = false;
+  bool _distanceSessionActive = false;
+  bool get _measuringDistance => _distanceSessionActive;
+
   /// Last factor the user set by hand. The opposite is what we solve for.
   LastEdited _lastEdited = LastEdited.aperture;
   /// Starts from the loaded film; editable only on this page.
-  late int _iso = widget.film.iso;
+  late FilmStock _film = widget.film;
+  /// Box / tungsten-rated speed. Daylight+85 uses [_meterIso].
+  late int _iso = _film.iso;
+  /// Tungsten stocks: meter at Kodak daylight EI with an 85 filter (−⅔ stop).
+  late bool _daylight85 = _film.isTungsten && _film.meterDaylight85;
   double _aperture = 2.8;
   double _shutter = 1 / 125;
 
+  /// EI used for EV / shutter / aperture solves.
+  int get _meterIso {
+    if (_film.isTungsten && _daylight85) {
+      return ExposureMath.eiWithWratten85(_iso);
+    }
+    return _iso;
+  }
+
+  String get _isoChipLabel {
+    if (_film.isTungsten && _daylight85) return 'EI $_meterIso';
+    return 'ISO $_iso';
+  }
+
+  String get _isoSubtitle {
+    if (_film.isTungsten && _daylight85) {
+      return 'EI $_meterIso +85';
+    }
+    if (_film.isTungsten) return 'ISO $_iso T';
+    return 'ISO $_iso';
+  }
+
+  UserCamera? _body;
+  List<UserLens> _availableLenses = [];
+  UserLens? _selectedLens;
+
   /// Focal-length viewfinder simulation — format is locked by the loaded roll.
-  FilmFormat get _simFormat => widget.film.frameFormat;
+  FilmFormat get _simFormat => _film.frameFormat;
   late double _simFocalMm = _simFormat.defaultFocalMm;
   LensInfo? _lensInfo;
+
+  List<double> get _availableApertures {
+    if (_body != null && !_body!.interchangeableLenses) {
+      return ExposureMath.aperturesInRange(
+        maxAperture: _body!.fixedMaxAperture,
+        minAperture: _body!.fixedMinAperture,
+      );
+    }
+    if (_selectedLens != null) {
+      return ExposureMath.aperturesInRange(
+        maxAperture: _selectedLens!.maxAperture,
+        minAperture: _selectedLens!.minAperture,
+      );
+    }
+    return ExposureMath.standardApertures;
+  }
+
+  List<double> get _availableShutters {
+    final body = _body;
+    if (body == null) return ExposureMath.standardShutters;
+    return ExposureMath.shuttersInRange(
+      fastest: body.fastestShutter,
+      slowest: body.slowestShutter,
+      includeBulb: body.hasBulb,
+    );
+  }
+
+  List<double> get _timedShutters =>
+      _availableShutters.where((s) => s > 0).toList();
+
+  /// Bulb (or no body yet): long holds continue past 30″ with no ceiling.
+  bool get _unlimitedBulbHolds {
+    final body = _body;
+    if (body == null) return true;
+    return body.hasBulb;
+  }
+
+  /// Timed shutter used for EV solve when B is selected.
+  double get _solveShutterSeconds {
+    if (!ExposureMath.isBulb(_shutter)) return _shutter;
+    final timed = _timedShutters;
+    return timed.isNotEmpty ? timed.last : 1.0;
+  }
+
+  List<double> get _focalDialLensesMm {
+    final lens = _selectedLens;
+    if (lens != null) {
+      if (lens.isZoom && lens.maxFocalMm != null) {
+        return [lens.minFocalMm, lens.maxFocalMm!];
+      }
+      return [lens.minFocalMm];
+    }
+    final body = _body;
+    if (body != null &&
+        !body.interchangeableLenses &&
+        body.fixedFocalMm != null) {
+      return [body.fixedFocalMm!];
+    }
+    return _simFormat.standardLensesMm;
+  }
+
+  /// Popup arc dial for choosing simulated focal length.
+  bool _focalDialOpen = false;
+  Timer? _focalDialHideTimer;
+  static const Duration _focalDialHideDelay = Duration(milliseconds: 1500);
 
   final GlobalKey _previewKey = GlobalKey();
 
@@ -188,6 +311,7 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _loadCalibration();
+    _loadGear();
     _startCamera();
   }
 
@@ -195,6 +319,91 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
     final value = await CalibrationStore.load();
     if (mounted && value != 0.0) {
       setState(() => _calibration = value);
+    }
+  }
+
+  Future<void> _loadGear() async {
+    // Prefer the persisted roll (includes last lens) over the constructor snapshot.
+    final saved = await FilmStockStore.loadSelected();
+    for (final f in saved) {
+      if (f.id == _film.id) {
+        if (!mounted) return;
+        setState(() {
+          _film = f;
+          _iso = f.iso;
+          _daylight85 = f.isTungsten && f.meterDaylight85;
+        });
+        break;
+      }
+    }
+
+    final cameraId = _film.cameraId;
+    if (cameraId == null) return;
+
+    final cameras = await GearStore.loadCameras();
+    UserCamera? body;
+    for (final c in cameras) {
+      if (c.id == cameraId) {
+        body = c;
+        break;
+      }
+    }
+    final cam = body;
+    if (cam == null || !mounted) return;
+
+    final allLenses = await GearStore.loadLenses();
+    final lenses = lensesForCamera(cam, allLenses);
+    UserLens? selected;
+    final lensId = _film.lensId;
+    if (lensId != null) {
+      for (final l in lenses) {
+        if (l.id == lensId) {
+          selected = l;
+          break;
+        }
+      }
+    }
+
+    if (!mounted) return;
+    setState(() {
+      _body = cam;
+      _availableLenses = lenses;
+      _selectedLens = selected;
+      _clampExposureToGear();
+      if (selected != null) {
+        _simFocalMm = _clampFocalToLens(selected, _simFocalMm);
+      } else if (!cam.interchangeableLenses && cam.fixedFocalMm != null) {
+        _simFocalMm = cam.fixedFocalMm!;
+      }
+    });
+  }
+
+  /// Keep simulated focal inside a lens zoom range (or snap to a prime).
+  double _clampFocalToLens(UserLens lens, double mm) {
+    if (!lens.isZoom || lens.maxFocalMm == null) return lens.minFocalMm;
+    final lo = lens.minFocalMm <= lens.maxFocalMm!
+        ? lens.minFocalMm
+        : lens.maxFocalMm!;
+    final hi = lens.minFocalMm <= lens.maxFocalMm!
+        ? lens.maxFocalMm!
+        : lens.minFocalMm;
+    return mm.clamp(lo, hi);
+  }
+
+  void _clampExposureToGear() {
+    final apertures = _availableApertures;
+    final shutters = _availableShutters;
+    if (apertures.isNotEmpty && !apertures.contains(_aperture)) {
+      _aperture = ExposureMath.snapAperture(_aperture, options: apertures);
+    }
+    if (shutters.isNotEmpty) {
+      final match = shutters.any((s) => (s - _shutter).abs() < 1e-12);
+      if (!match) {
+        _shutter = ExposureMath.snapShutter(
+          ExposureMath.isBulb(_shutter) ? 1 / 125 : _shutter,
+          options: shutters,
+        );
+      }
     }
   }
 
@@ -211,6 +420,10 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
 
   @override
   void dispose() {
+    _focalDialHideTimer?.cancel();
+    _captureHintTimer?.cancel();
+    unawaited(_distanceEstimator?.stop());
+    _distanceEstimator = null;
     WidgetsBinding.instance.removeObserver(this);
     final ctrl = _controller;
     if (ctrl != null) {
@@ -396,32 +609,47 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
 
     final shutter = _stampShutter();
     final aperture = _stampAperture();
-    final iso = _iso;
-    final filmId = widget.film.id;
-    final filmName = widget.film.name;
+    final iso = _meterIso;
+    final filmId = _film.id;
+    final filmName = _film.name;
     final formatLabel = _simFormat.label;
     final focalMm = _simFocalMm;
-    final ev = _ev;
+    // Persist the Hasselblad lens-scale EV the user sees, at this film ISO.
+    final ev = _lensEv;
     final cropFraction = _simCrop;
     final cropAspectRatio = _simFormat.aspectRatio;
 
-    setState(() => _saving = true);
+    setState(() {
+      _saving = true;
+      _setCaptureHint('Capturing…');
+    });
     late final Uint8List jpeg;
     try {
       jpeg = await _captureStillBytes(ctrl);
     } catch (e) {
-      if (mounted) _toast('Could not capture: $e');
+      if (mounted) {
+        setState(() {
+          _saving = false;
+          _setCaptureHint(
+            'Capture failed',
+            error: true,
+            clearAfter: const Duration(seconds: 3),
+          );
+        });
+      } else {
+        _saving = false;
+      }
       return;
     } finally {
-      if (mounted) {
+      if (mounted && _saving) {
         setState(() => _saving = false);
-      } else {
+      } else if (!mounted) {
         _saving = false;
       }
     }
 
     if (!mounted) return;
-    _toast('Saving to album…');
+    setState(() => _setCaptureHint('Saving…'));
     AlbumShotStore.beginBackgroundSave();
     unawaited(
       _saveCaptureToAlbum(
@@ -471,11 +699,45 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
         ev: ev,
         flash: false,
       );
-      if (mounted) _toast('Saved to album');
+      if (mounted) {
+        setState(
+          () => _setCaptureHint(
+            'Saved',
+            clearAfter: const Duration(seconds: 2),
+          ),
+        );
+      }
     } catch (e) {
-      if (mounted) _toast('Could not save: $e');
+      if (mounted) {
+        setState(
+          () => _setCaptureHint(
+            'Save failed',
+            error: true,
+            clearAfter: const Duration(seconds: 3),
+          ),
+        );
+      }
     } finally {
       AlbumShotStore.endBackgroundSave();
+    }
+  }
+
+  void _setCaptureHint(
+    String? message, {
+    bool error = false,
+    Duration? clearAfter,
+  }) {
+    _captureHintTimer?.cancel();
+    _captureHint = message;
+    _captureHintError = error;
+    if (message != null && clearAfter != null) {
+      _captureHintTimer = Timer(clearAfter, () {
+        if (!mounted) return;
+        setState(() {
+          _captureHint = null;
+          _captureHintError = false;
+        });
+      });
     }
   }
 
@@ -490,9 +752,15 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
         final t = ExposureMath.shutterFromEv(
           ev100: ev,
           aperture: _aperture,
-          iso: _iso,
+          iso: _meterIso,
         );
-        return ExposureMath.formatShutter(ExposureMath.snapShutter(t));
+        return ExposureMath.formatShutter(
+          ExposureMath.snapShutter(
+            t,
+            options: _timedShutters,
+            allowUnlimited: _unlimitedBulbHolds,
+          ),
+        );
       }
     }
     return ExposureMath.formatShutter(_shutter);
@@ -504,25 +772,15 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
       if (ev != null) {
         final n = ExposureMath.apertureFromEv(
           ev100: ev,
-          shutterSeconds: _shutter,
-          iso: _iso,
+          shutterSeconds: _solveShutterSeconds,
+          iso: _meterIso,
         );
-        return ExposureMath.formatAperture(ExposureMath.snapAperture(n));
+        return ExposureMath.formatAperture(
+          ExposureMath.snapAperture(n, options: _availableApertures),
+        );
       }
     }
     return ExposureMath.formatAperture(_aperture);
-  }
-
-  void _toast(String message) {
-    final messenger = ScaffoldMessenger.maybeOf(context);
-    messenger?.hideCurrentSnackBar();
-    messenger?.showSnackBar(
-      SnackBar(
-        content: Text(message),
-        behavior: SnackBarBehavior.floating,
-        duration: const Duration(seconds: 2),
-      ),
-    );
   }
 
   /// Runs a modal, pausing camera-driven rebuilds for as long as it is open.
@@ -550,6 +808,30 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
         spot = Offset(mapped.x, mapped.y);
       }
 
+      if (_distanceStartPending) {
+        _distanceStartPending = false;
+        unawaited(_beginDistanceMeasure(image, spot, previewSize));
+      } else if (_distanceEstimator != null && _measuringDistance) {
+        final estimator = _distanceEstimator!;
+        final est = estimator.processFrame(
+          image: image,
+          spotNormalized: spot,
+          widgetSize: previewSize,
+        );
+        if (est != null) {
+          _distanceEstimate = est;
+          if (est.isUsable) {
+            _subjectDistanceM = est.metres;
+          }
+          final locked = est.progress >= 1.0 &&
+              est.confidence == DistanceConfidence.high;
+          final stopped = !estimator.isRunning;
+          if (locked || stopped) {
+            unawaited(_finishDistanceMeasure(keepResult: est.isUsable || locked));
+          }
+        }
+      }
+
       final sample = sampleSpot(
         image: image,
         spot: spot,
@@ -574,7 +856,9 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
         _ev = previous == null ? raw : previous + (raw - previous) * 0.35;
       }
 
-      _maybeAutoMeter(sample);
+      if (!_measuringDistance) {
+        _maybeAutoMeter(sample);
+      }
 
       if (_publishClock.elapsedMilliseconds >= 80) {
         _publishClock.reset();
@@ -584,6 +868,69 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
       _isProcessing = false;
     }
   }
+
+  Future<void> _beginDistanceMeasure(
+    CameraImage image,
+    Offset spot,
+    Size previewSize,
+  ) async {
+    await _distanceEstimator?.stop();
+    final est = DistanceEstimator(
+      quarterTurns: _quarterTurns,
+      mirror: _mirror,
+      focalLengthMm: _lensInfo?.focalLengthMm,
+      sensorWidthMm: _lensInfo?.sensorWidthMm,
+    );
+    await est.start(
+      spotNormalized: spot,
+      widgetSize: previewSize,
+      firstFrame: image,
+    );
+    if (!mounted) {
+      await est.stop();
+      return;
+    }
+    setState(() {
+      _distanceEstimator = est;
+      _distanceEstimate = est.last;
+    });
+  }
+
+  void _requestDistanceMeasure() {
+    if (!_isInitialized || _saving || _measuring) return;
+    setState(() {
+      _distanceSessionActive = true;
+      _distanceStartPending = true;
+      _distanceEstimate = null;
+      _status = 'Measuring distance…';
+    });
+  }
+
+  Future<void> _finishDistanceMeasure({required bool keepResult}) async {
+    final est = _distanceEstimator;
+    final reading = _distanceEstimate;
+    await est?.stop();
+    if (!mounted) return;
+    setState(() {
+      _distanceEstimator = null;
+      _distanceStartPending = false;
+      _distanceSessionActive = false;
+      if (keepResult && reading != null && reading.isUsable) {
+        _subjectDistanceM = reading.metres;
+        _distanceEstimate = reading;
+        _status = 'Distance ${reading.displayPrefix}'
+            '${formatLength(reading.metres, useFeet: false)}';
+      } else if (!keepResult) {
+        _distanceEstimate = null;
+        _status = 'Distance measure cancelled';
+      } else {
+        _status = reading?.coaching ?? 'Distance unavailable — enter manually';
+      }
+    });
+  }
+
+  Future<void> _cancelDistanceMeasure() =>
+      _finishDistanceMeasure(keepResult: false);
 
   /// Re-meters when the locked exposure no longer suits the spot: once the
   /// patch clips or crushes, the tone curve stops being invertible and the
@@ -607,6 +954,7 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
     final h = box.size.height;
     if (w <= 0 || h <= 0) return;
     if (local.dx < 0 || local.dy < 0 || local.dx > w || local.dy > h) return;
+    final wasMeasuringDistance = _measuringDistance;
     setState(() {
       _meterPoint = Offset(
         (local.dx / w).clamp(0.0, 1.0),
@@ -614,6 +962,13 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
       );
       _ev = null;
     });
+    if (wasMeasuringDistance) {
+      // Retarget: stop current session and lock the new point next frame.
+      unawaited(_finishDistanceMeasure(keepResult: false).then((_) {
+        if (mounted) _requestDistanceMeasure();
+      }));
+      return;
+    }
     _measure();
   }
 
@@ -627,60 +982,118 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
     _measure();
   }
 
-  Future<void> _onFocalSliderChanged(double index) async {
-    final lenses = _simFormat.standardLensesMm;
-    if (lenses.isEmpty) return;
-    final i = index.round().clamp(0, lenses.length - 1);
-    setState(() => _simFocalMm = lenses[i]);
+  void _openFocalDial() {
+    setState(() => _focalDialOpen = true);
+    _bumpFocalDialHideTimer();
+  }
+
+  void _setFocalMm(double mm) {
+    if ((_simFocalMm - mm).abs() < 0.01) return;
+    setState(() => _simFocalMm = mm);
+  }
+
+  void _bumpFocalDialHideTimer() {
+    _focalDialHideTimer?.cancel();
+    _focalDialHideTimer = Timer(_focalDialHideDelay, () {
+      if (!mounted) return;
+      setState(() => _focalDialOpen = false);
+    });
+  }
+
+  void _closeFocalDial() {
+    _focalDialHideTimer?.cancel();
+    if (_focalDialOpen) setState(() => _focalDialOpen = false);
   }
 
   // -------------------------------------------------------------- calculator
 
   String get _displayedShutter {
     if (!_solvingShutter) return ExposureMath.formatShutter(_shutter);
-    final ev = _ev;
-    if (ev == null) return '—';
-    final exact =
-        ExposureMath.shutterFromEv(ev100: ev, aperture: _aperture, iso: _iso);
-    return ExposureMath.formatShutter(ExposureMath.snapShutter(exact));
+    final result = _compensationResult(0);
+    if (result == null) return '—';
+    return result.limitLabel ?? result.snappedLabel;
   }
 
   String get _displayedAperture {
     if (!_solvingAperture) return ExposureMath.formatAperture(_aperture);
-    final ev = _ev;
-    if (ev == null) return '—';
-    final exact = ExposureMath.apertureFromEv(
-      ev100: ev,
-      shutterSeconds: _shutter,
-      iso: _iso,
-    );
-    return ExposureMath.formatAperture(ExposureMath.snapAperture(exact));
+    final result = _compensationResult(0);
+    if (result == null) return '—';
+    return result.limitLabel ?? result.snappedLabel;
   }
 
-  /// Solved shutter or aperture at a given exposure-compensation stop.
+  /// Exact / snapped EC readout, plus `over`/`under` when beyond gear limits.
   ///
-  /// +EC means more exposure, so the calculator uses EV − EC.
-  String _valueAtCompensation(int compensationStops, {bool exact = false}) {
+  /// Scale matches the Hasselblad EV dial: **+** raises working EV (less
+  /// exposure → faster shutter / smaller aperture), **−** lowers it.
+  _CompResult? _compensationResult(int compensationStops) {
     final ev = _ev;
-    if (ev == null) return '—';
-    final adjusted = ev - compensationStops;
+    if (ev == null) return null;
+    final adjusted = ev + compensationStops;
     if (_solvingShutter) {
       final seconds = ExposureMath.shutterFromEv(
         ev100: adjusted,
         aperture: _aperture,
-        iso: _iso,
+        iso: _meterIso,
       );
-      return ExposureMath.formatShutter(
-        exact ? seconds : ExposureMath.snapShutter(seconds),
+      final timed = _timedShutters;
+      final fastest =
+          timed.isEmpty ? null : timed.reduce((a, b) => a < b ? a : b);
+      final slowest =
+          timed.isEmpty ? null : timed.reduce((a, b) => a > b ? a : b);
+      final unlimited = _unlimitedBulbHolds;
+      String? limit;
+      if (fastest != null &&
+          seconds > 0 &&
+          !seconds.isNaN &&
+          !seconds.isInfinite &&
+          seconds < fastest * (1 - 1e-9)) {
+        limit = 'over';
+      } else if (slowest != null &&
+          seconds > 0 &&
+          !seconds.isNaN &&
+          !seconds.isInfinite &&
+          seconds > slowest * (1 + 1e-9) &&
+          !unlimited) {
+        limit = 'under';
+      }
+      return _CompResult(
+        exactLabel: ExposureMath.formatShutter(seconds),
+        snappedLabel: ExposureMath.formatShutter(
+          ExposureMath.snapShutter(
+            seconds,
+            options: timed,
+            allowUnlimited: unlimited,
+          ),
+        ),
+        limitLabel: limit,
       );
     }
     final f = ExposureMath.apertureFromEv(
       ev100: adjusted,
-      shutterSeconds: _shutter,
-      iso: _iso,
+      shutterSeconds: _solveShutterSeconds,
+      iso: _meterIso,
     );
-    return ExposureMath.formatAperture(
-      exact ? f : ExposureMath.snapAperture(f),
+    final apertures = _availableApertures;
+    final widest =
+        apertures.isEmpty ? null : apertures.reduce((a, b) => a < b ? a : b);
+    final smallest =
+        apertures.isEmpty ? null : apertures.reduce((a, b) => a > b ? a : b);
+    String? limit;
+    if (f > 0 && !f.isNaN && !f.isInfinite) {
+      // Biggest aperture = widest = smallest f-number; beyond → over.
+      if (widest != null && f < widest * (1 - 1e-9)) {
+        limit = 'over';
+      } else if (smallest != null && f > smallest * (1 + 1e-9)) {
+        // Smallest aperture = narrowest = largest f-number; beyond → under.
+        limit = 'under';
+      }
+    }
+    return _CompResult(
+      exactLabel: ExposureMath.formatAperture(f),
+      snappedLabel: ExposureMath.formatAperture(
+        ExposureMath.snapAperture(f, options: apertures),
+      ),
+      limitLabel: limit,
     );
   }
 
@@ -692,7 +1105,7 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
   void _openAlbum() {
     Navigator.of(context).push(
       MaterialPageRoute<void>(
-        builder: (_) => AlbumPage(film: widget.film),
+        builder: (_) => AlbumPage(film: _film),
       ),
     );
   }
@@ -701,9 +1114,10 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
     Navigator.of(context).push(
       MaterialPageRoute<void>(
         builder: (_) => FlashPage(
-          iso: _iso,
+          iso: _meterIso,
           aperture: _aperture,
           ambientEv: _ev,
+          initialDistance: _subjectDistanceM,
         ),
       ),
     );
@@ -734,11 +1148,15 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Text(
-              widget.film.name,
+              _film.name,
               style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
             ),
             Text(
-              '${widget.film.rollFormatLabel}  ·  ISO $_iso',
+              [
+                _film.rollFormatLabel,
+                _isoSubtitle,
+                if (_film.cameraLabel != null) _film.cameraLabel!,
+              ].join('  ·  '),
               style: const TextStyle(fontSize: 11, color: Colors.white54),
             ),
           ],
@@ -748,13 +1166,26 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
             onPressed: _pickIso,
             icon: const Icon(Icons.edit_outlined, size: 16, color: _accent),
             label: Text(
-              'ISO $_iso',
+              _isoChipLabel,
               style: const TextStyle(
                 color: _accent,
                 fontWeight: FontWeight.w800,
                 fontSize: 13,
               ),
             ),
+          ),
+          IconButton(
+            tooltip: _measuringDistance ? 'Cancel measure' : 'Measure distance',
+            icon: Icon(
+              _measuringDistance
+                  ? Icons.close
+                  : Icons.straighten_outlined,
+            ),
+            onPressed: !_isInitialized
+                ? null
+                : (_measuringDistance
+                    ? _cancelDistanceMeasure
+                    : _requestDistanceMeasure),
           ),
           IconButton(
             tooltip: 'Flash',
@@ -857,115 +1288,212 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
               final viewSize = Size(fitted.width, fitted.height);
               _previewSize = viewSize;
 
-              return Center(
-                child: SizedBox(
-                  key: _previewKey,
-                  width: viewSize.width,
-                  height: viewSize.height,
-                  child: GestureDetector(
-                    onTapUp: _onTapUp,
-                    child: Stack(
-                      fit: StackFit.expand,
-                      children: [
-                        ClipRect(
-                          child: Transform.scale(
-                            scale: 1.0 / crop,
-                            alignment: Alignment.center,
-                            child: FittedBox(
-                              fit: BoxFit.cover,
-                              alignment: Alignment.center,
-                              child: SizedBox(
-                                // previewSize is sensor-oriented (usually
-                                // landscape); swap so the child matches the
-                                // portrait CameraPreview aspect. Parent
-                                // constraints stay tight — no OverflowBox —
-                                // so cover scales against the viewfinder.
-                                width: ctrl.value.previewSize?.height ??
-                                    viewSize.width,
-                                height: ctrl.value.previewSize?.width ??
-                                    viewSize.height,
-                                child: CameraPreview(ctrl),
-                              ),
-                            ),
-                          ),
-                        ),
-                        IgnorePointer(
-                          child: CustomPaint(
-                            painter: _FilmFramePainter(
-                              color: _accent,
-                              showThirds: true,
-                            ),
-                          ),
-                        ),
-                        CustomPaint(
-                          painter: _SpotPainter(
-                            point: _meterPoint,
-                            radius: _spotRadius,
-                            color: _accent,
-                          ),
-                        ),
-                        Positioned(
-                          top: 10,
-                          left: 10,
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              _statusChip(),
-                              if (_lensInfo != null) ...[
-                                const SizedBox(height: 6),
-                                _chip(
-                                  'Lens ${_lensInfo!.focalLengthMm.toStringAsFixed(1)} mm',
+              return Stack(
+                fit: StackFit.expand,
+                children: [
+                  Center(
+                    child: SizedBox(
+                      key: _previewKey,
+                      width: viewSize.width,
+                      height: viewSize.height,
+                      child: GestureDetector(
+                        onTapUp: _onTapUp,
+                        child: Stack(
+                          fit: StackFit.expand,
+                          children: [
+                            ClipRect(
+                              child: Transform.scale(
+                                scale: 1.0 / crop,
+                                alignment: Alignment.center,
+                                child: FittedBox(
+                                  fit: BoxFit.cover,
+                                  alignment: Alignment.center,
+                                  child: SizedBox(
+                                    // previewSize is sensor-oriented (usually
+                                    // landscape); swap so the child matches the
+                                    // portrait CameraPreview aspect. Parent
+                                    // constraints stay tight — no OverflowBox —
+                                    // so cover scales against the viewfinder.
+                                    width: ctrl.value.previewSize?.height ??
+                                        viewSize.width,
+                                    height: ctrl.value.previewSize?.width ??
+                                        viewSize.height,
+                                    child: CameraPreview(ctrl),
+                                  ),
                                 ),
-                              ],
-                              if (_simLimited) ...[
-                                const SizedBox(height: 6),
-                                _chip('At phone FOV limit'),
-                              ],
-                            ],
-                          ),
-                        ),
-                        Positioned(
-                          bottom: 8,
-                          right: 8,
-                          child: Material(
-                            color: Colors.black54,
-                            borderRadius: BorderRadius.circular(10),
-                            child: IconButton(
-                              tooltip: 'Center spot',
-                              onPressed: (_measuring || _saving)
-                                  ? null
-                                  : _centerMeterPoint,
-                              visualDensity: VisualDensity.compact,
-                              padding: const EdgeInsets.all(8),
-                              constraints: const BoxConstraints(
-                                minWidth: 40,
-                                minHeight: 40,
-                              ),
-                              icon: Icon(
-                                Icons.filter_center_focus,
-                                size: 22,
-                                color: (_measuring || _saving)
-                                    ? Colors.white38
-                                    : _accent,
                               ),
                             ),
-                          ),
+                            IgnorePointer(
+                              child: CustomPaint(
+                                painter: _FilmFramePainter(
+                                  color: _accent,
+                                  showThirds: true,
+                                ),
+                              ),
+                            ),
+                            CustomPaint(
+                              painter: _SpotPainter(
+                                point: _meterPoint,
+                                radius: _spotRadius,
+                                color: _accent,
+                              ),
+                            ),
+                            if (_measuringDistance)
+                              Positioned.fill(
+                                child: _distanceMeasureOverlay(),
+                              ),
+                            Positioned(
+                              top: 10,
+                              left: 10,
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  _statusChip(),
+                                  if (_subjectDistanceM != null &&
+                                      !_measuringDistance) ...[
+                                    const SizedBox(height: 6),
+                                    _chip(
+                                      'Dist ${_distanceEstimate?.displayPrefix ?? ''}'
+                                      '${formatLength(_subjectDistanceM!, useFeet: false)}',
+                                    ),
+                                  ],
+                                  if (_lensInfo != null) ...[
+                                    const SizedBox(height: 6),
+                                    _chip(
+                                      'Lens ${_lensInfo!.focalLengthMm.toStringAsFixed(1)} mm',
+                                    ),
+                                  ],
+                                  if (_simLimited) ...[
+                                    const SizedBox(height: 6),
+                                    _chip('At phone FOV limit'),
+                                  ],
+                                ],
+                              ),
+                            ),
+                            if (!_focalDialOpen)
+                              Positioned(
+                                bottom: 8,
+                                right: 8,
+                                child: Material(
+                                  color: Colors.black54,
+                                  borderRadius: BorderRadius.circular(10),
+                                  child: IconButton(
+                                    tooltip: 'Center spot',
+                                    onPressed: (_measuring || _saving)
+                                        ? null
+                                        : _centerMeterPoint,
+                                    visualDensity: VisualDensity.compact,
+                                    padding: const EdgeInsets.all(8),
+                                    constraints: const BoxConstraints(
+                                      minWidth: 40,
+                                      minHeight: 40,
+                                    ),
+                                    icon: Icon(
+                                      Icons.filter_center_focus,
+                                      size: 22,
+                                      color: (_measuring || _saving)
+                                          ? Colors.white38
+                                          : _accent,
+                                    ),
+                                  ),
+                                ),
+                              ),
+                          ],
                         ),
-                      ],
+                      ),
                     ),
                   ),
-                ),
+                  if (_focalDialOpen)
+                    Positioned(
+                      left: 0,
+                      right: 0,
+                      bottom: 0,
+                      child: FocalArcDial(
+                        lensesMm: _focalDialLensesMm,
+                        valueMm: _simFocalMm,
+                        format: _simFormat,
+                        accent: _accent,
+                        onChanged: _setFocalMm,
+                        onInteraction: _bumpFocalDialHideTimer,
+                      ),
+                    ),
+                ],
               );
             },
           ),
         ),
         _buildShutterBar(),
-        _buildFocalSlider(),
       ],
     );
   }
 
+  Widget _distanceMeasureOverlay() {
+    final est = _distanceEstimate;
+    final progress = est?.progress ?? 0.05;
+    final coaching = est?.coaching ??
+        'Tap the subject, then move sideways slowly';
+    final metres = est?.metres;
+    final showDist = metres != null &&
+        metres.isFinite &&
+        (est?.sampleCount ?? 0) > 0;
+    return IgnorePointer(
+      child: ColoredBox(
+        color: Colors.black38,
+        child: Align(
+          alignment: Alignment.bottomCenter,
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                SizedBox(
+                  width: 44,
+                  height: 44,
+                  child: Stack(
+                    fit: StackFit.expand,
+                    children: [
+                      CircularProgressIndicator(
+                        value: progress.clamp(0.05, 1.0),
+                        color: _accent,
+                        backgroundColor: Colors.white24,
+                        strokeWidth: 3,
+                      ),
+                      Center(
+                        child: Text(
+                          showDist
+                              ? '${est!.displayPrefix}${formatNumber(metres)}'
+                              : '${(progress * 100).round()}',
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 11,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 10),
+                Text(
+                  coaching,
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 13,
+                    fontWeight: FontWeight.w600,
+                    height: 1.3,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
   Widget _buildShutterBar() {
+    final hint = _captureHint;
     return Container(
       color: const Color(0xFF0F0F0F),
       padding: const EdgeInsets.fromLTRB(10, 4, 10, 2),
@@ -973,95 +1501,35 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
         crossAxisAlignment: CrossAxisAlignment.center,
         children: [
           _albumButton(),
-          const Expanded(child: SizedBox.shrink()),
-          _shutterButton(),
-        ],
-      ),
-    );
-  }
-
-  /// Horizontal focal-length dial under the shutter controls.
-  Widget _buildFocalSlider() {
-    final lenses = _simFormat.standardLensesMm;
-    final last = lenses.length - 1;
-    var index = lenses.indexWhere((m) => (m - _simFocalMm).abs() < 0.01);
-    if (index < 0) index = lenses.indexOf(_simFormat.defaultFocalMm);
-    if (index < 0) index = 0;
-
-    return Container(
-      color: const Color(0xFF0F0F0F),
-      padding: const EdgeInsets.fromLTRB(8, 2, 8, 4),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          Text(
-            '${_simFormat.label}  ·  ${_simFocalMm.round()} mm'
-            '  (≈ ${_simFormat.to35mmEquivalent(_simFocalMm).round()} mm eq)',
-            textAlign: TextAlign.center,
-            style: const TextStyle(
-              fontSize: 12,
-              fontWeight: FontWeight.w700,
-              color: _accent,
+          Expanded(
+            child: Align(
+              alignment: Alignment.centerRight,
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  if (hint != null) ...[
+                    ConstrainedBox(
+                      constraints: const BoxConstraints(maxWidth: 140),
+                      child: Text(
+                        hint,
+                        textAlign: TextAlign.right,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          fontSize: 12,
+                          fontWeight: FontWeight.w600,
+                          color: _captureHintError
+                              ? Colors.orangeAccent
+                              : Colors.white70,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 10),
+                  ],
+                  _shutterButton(),
+                ],
+              ),
             ),
-          ),
-          Row(
-            children: [
-              SizedBox(
-                width: 28,
-                child: Text(
-                  '${lenses.first.round()}',
-                  textAlign: TextAlign.center,
-                  style: const TextStyle(
-                    fontSize: 10,
-                    color: Colors.white54,
-                    fontWeight: FontWeight.w600,
-                  ),
-                ),
-              ),
-              Expanded(
-                child: SliderTheme(
-                  data: SliderTheme.of(context).copyWith(
-                    trackHeight: 2.5,
-                    activeTrackColor: _accent,
-                    inactiveTrackColor: Colors.white12,
-                    thumbColor: _accent,
-                    overlayColor: _accent.withValues(alpha: 0.2),
-                    activeTickMarkColor: _accent,
-                    inactiveTickMarkColor: Colors.white38,
-                    tickMarkShape: const RoundSliderTickMarkShape(
-                      tickMarkRadius: 2,
-                    ),
-                    thumbShape: const RoundSliderThumbShape(
-                      enabledThumbRadius: 6.5,
-                    ),
-                    overlayShape: const RoundSliderOverlayShape(
-                      overlayRadius: 12,
-                    ),
-                  ),
-                  child: Slider(
-                    value: index.toDouble().clamp(0, last.toDouble()),
-                    min: 0,
-                    max: last.toDouble(),
-                    divisions: last,
-                    label: '${lenses[index].round()} mm',
-                    onChanged: _onFocalSliderChanged,
-                  ),
-                ),
-              ),
-              SizedBox(
-                width: 36,
-                child: Text(
-                  '${lenses.last.round()}',
-                  textAlign: TextAlign.center,
-                  maxLines: 1,
-                  style: const TextStyle(
-                    fontSize: 10,
-                    color: Colors.white54,
-                    fontWeight: FontWeight.w600,
-                  ),
-                ),
-              ),
-            ],
           ),
         ],
       ),
@@ -1166,7 +1634,8 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
   }
 
   Widget _buildExposurePanel() {
-    final ev = _ev;
+    final ev100 = _ev;
+    final lensEv = _lensEv;
     final params = _params;
     final sample = _sample;
 
@@ -1184,8 +1653,31 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
             children: [
               Expanded(
                 child: _pickerTile(
+                  label: 'Aperture',
+                  value: _displayedAperture,
+                  onTap: _pickAperture,
+                  emphasize: _solvingAperture,
+                ),
+              ),
+              const SizedBox(width: 6),
+              Expanded(
+                child: _pickerTile(
+                  label: 'Focal',
+                  value: _focalTileValue,
+                  onTap: _onFocalPressed,
+                  emphasize: _focalDialOpen || _selectedLens != null,
+                  icon: Icons.straighten,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 6),
+          Row(
+            children: [
+              Expanded(
+                child: _pickerTile(
                   label: 'EV',
-                  value: ev == null ? '—' : ev.toStringAsFixed(1),
+                  value: lensEv == null ? '—' : lensEv.toStringAsFixed(1),
                   onTap: () => setState(
                     () => _meterDetailsOpen = !_meterDetailsOpen,
                   ),
@@ -1204,22 +1696,21 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
                   emphasize: _solvingShutter,
                 ),
               ),
-              const SizedBox(width: 6),
-              Expanded(
-                child: _pickerTile(
-                  label: 'Aperture',
-                  value: _displayedAperture,
-                  onTap: _pickAperture,
-                  emphasize: _solvingAperture,
-                ),
-              ),
             ],
           ),
           if (_meterDetailsOpen) ...[
             const SizedBox(height: 6),
-            if (ev != null)
+            Text(
+              _film.isTungsten && _daylight85
+                  ? 'Lens EV (Hasselblad) at EI $_meterIso (daylight +85)'
+                  : _film.isTungsten
+                      ? 'Lens EV (Hasselblad) at ISO $_iso (tungsten)'
+                      : 'Lens EV (Hasselblad) at ISO $_meterIso',
+              style: const TextStyle(fontSize: 10, color: Colors.white54),
+            ),
+            if (ev100 != null)
               Text(
-                _evToLabel(ev),
+                _evToLabel(ev100),
                 style: const TextStyle(fontSize: 10, color: Colors.white54),
               ),
             Text(
@@ -1305,8 +1796,7 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
   Widget _buildExposureCompAxis() {
     const comps = [-3, -2, -1, 0, 1, 2, 3];
     final solvingLabel = _solvingShutter ? 'Shutter' : 'Aperture';
-    final exactAtZero =
-        _ev == null ? null : _valueAtCompensation(0, exact: true);
+    final zero = _compensationResult(0);
 
     return Container(
       padding: const EdgeInsets.fromLTRB(6, 6, 6, 4),
@@ -1347,8 +1837,7 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
                 Expanded(
                   child: _compTick(
                     compensation: comp,
-                    value: _valueAtCompensation(comp),
-                    exactValue: comp == 0 ? exactAtZero : null,
+                    result: comp == 0 ? zero : _compensationResult(comp),
                   ),
                 ),
             ],
@@ -1358,14 +1847,31 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
     );
   }
 
+  static const Color _limitColor = Color(0xFFFF6E40);
+
   Widget _compTick({
     required int compensation,
-    required String value,
-    String? exactValue,
+    required _CompResult? result,
   }) {
     final isZero = compensation == 0;
-    final showExact =
-        isZero && exactValue != null && exactValue != '—' && exactValue != value;
+    final outOfRange = result?.limitLabel != null;
+    final value = result == null
+        ? '—'
+        : (result.limitLabel ?? result.snappedLabel);
+    final exactValue = result?.exactLabel;
+    final showExact = isZero &&
+        exactValue != null &&
+        exactValue != '—' &&
+        (outOfRange || exactValue != result?.snappedLabel);
+    final valueColor = outOfRange
+        ? _limitColor
+        : (isZero ? _accent : Colors.white70);
+    final tickColor = outOfRange
+        ? _limitColor
+        : (isZero ? _accent : Colors.white38);
+    final compColor = outOfRange
+        ? _limitColor
+        : (isZero ? _accent : Colors.white54);
 
     return Column(
       children: [
@@ -1383,7 +1889,9 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
                   style: TextStyle(
                     fontSize: 9,
                     fontWeight: FontWeight.w600,
-                    color: _accent.withValues(alpha: 0.75),
+                    color: outOfRange
+                        ? _limitColor.withValues(alpha: 0.8)
+                        : _accent.withValues(alpha: 0.75),
                     height: 1.0,
                   ),
                 ),
@@ -1396,7 +1904,7 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
                 style: TextStyle(
                   fontSize: isZero ? 13 : 9.5,
                   fontWeight: isZero ? FontWeight.w800 : FontWeight.w600,
-                  color: isZero ? _accent : Colors.white70,
+                  color: valueColor,
                   height: 1.0,
                 ),
               ),
@@ -1418,9 +1926,9 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
                 ),
               ),
               Container(
-                width: isZero ? 2 : 1.5,
-                height: isZero ? 12 : 8,
-                color: isZero ? _accent : Colors.white38,
+                width: isZero || outOfRange ? 2 : 1.5,
+                height: isZero || outOfRange ? 12 : 8,
+                color: tickColor,
               ),
             ],
           ),
@@ -1431,7 +1939,7 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
           style: TextStyle(
             fontSize: isZero ? 11 : 9.5,
             fontWeight: isZero ? FontWeight.w800 : FontWeight.w600,
-            color: isZero ? _accent : Colors.white54,
+            color: compColor,
             height: 1.0,
           ),
         ),
@@ -1442,7 +1950,7 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
   Widget _pickerTile({
     required String label,
     required String value,
-    required VoidCallback onTap,
+    VoidCallback? onTap,
     IconData icon = Icons.expand_more,
     bool emphasize = false,
   }) {
@@ -1507,6 +2015,10 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
   }
 
   Future<void> _pickIso() async {
+    if (_film.isTungsten) {
+      await _pickTungstenMetering();
+      return;
+    }
     final chosen = await _showWheelPicker<int>(
       title: 'Film ISO',
       items: ExposureMath.standardIsos,
@@ -1516,10 +2028,371 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
     if (chosen != null) setState(() => _iso = chosen);
   }
 
+  Future<void> _pickTungstenMetering() async {
+    final daylightEi = ExposureMath.eiWithWratten85(_iso);
+    final choice = await _whileModalOpen(() {
+      return showModalBottomSheet<_TungstenMeterChoice>(
+        context: context,
+        backgroundColor: const Color(0xFF161616),
+        shape: const RoundedRectangleBorder(
+          borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+        ),
+        builder: (ctx) {
+          return SafeArea(
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  const Text(
+                    'Tungsten film',
+                    style: TextStyle(
+                      color: Colors.white,
+                      fontSize: 16,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                  const SizedBox(height: 6),
+                  Text(
+                    'Rated ISO $_iso under tungsten. In daylight with an 85 '
+                    'filter, Kodak rates EI $daylightEi (−⅔ stop). '
+                    'Daylight without 85: keep ISO $_iso (expect a cool cast).',
+                    style: const TextStyle(
+                      color: Colors.white54,
+                      fontSize: 12,
+                      height: 1.35,
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  _tungstenMeterTile(
+                    selected: !_daylight85,
+                    title: 'Tungsten / unfiltered',
+                    subtitle: 'Meter at ISO $_iso',
+                    onTap: () => Navigator.pop(
+                      ctx,
+                      _TungstenMeterChoice.tungstenRated,
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  _tungstenMeterTile(
+                    selected: _daylight85,
+                    title: 'Daylight + 85 filter',
+                    subtitle: 'Meter at EI $daylightEi',
+                    onTap: () => Navigator.pop(
+                      ctx,
+                      _TungstenMeterChoice.daylight85,
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  TextButton(
+                    onPressed: () => Navigator.pop(
+                      ctx,
+                      _TungstenMeterChoice.changeBoxSpeed,
+                    ),
+                    child: const Text(
+                      'Change box speed…',
+                      style: TextStyle(color: _accent),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          );
+        },
+      );
+    });
+    if (!mounted || choice == null) return;
+
+    switch (choice) {
+      case _TungstenMeterChoice.tungstenRated:
+        await _setDaylight85(false);
+      case _TungstenMeterChoice.daylight85:
+        await _setDaylight85(true);
+      case _TungstenMeterChoice.changeBoxSpeed:
+        final chosen = await _showWheelPicker<int>(
+          title: 'Box / tungsten ISO',
+          items: ExposureMath.standardIsos,
+          initial: _iso,
+          labelOf: (v) => '$v',
+        );
+        if (chosen != null && mounted) {
+          final updated = _film.copyWith(iso: chosen);
+          setState(() {
+            _iso = chosen;
+            _film = updated;
+          });
+          await FilmStockStore.upsertSelected(updated);
+        }
+    }
+  }
+
+  Future<void> _setDaylight85(bool value) async {
+    if (!_film.isTungsten) return;
+    final updated = _film.copyWith(meterDaylight85: value);
+    setState(() {
+      _daylight85 = value;
+      _film = updated;
+    });
+    await FilmStockStore.upsertSelected(updated);
+  }
+
+  Widget _tungstenMeterTile({
+    required bool selected,
+    required String title,
+    required String subtitle,
+    required VoidCallback onTap,
+  }) {
+    return Material(
+      color: selected
+          ? _accent.withValues(alpha: 0.14)
+          : const Color(0xFF222222),
+      borderRadius: BorderRadius.circular(10),
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(10),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+          child: Row(
+            children: [
+              Icon(
+                selected
+                    ? Icons.radio_button_checked
+                    : Icons.radio_button_off,
+                color: selected ? _accent : Colors.white38,
+                size: 20,
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      title,
+                      style: TextStyle(
+                        color: selected ? _accent : Colors.white,
+                        fontWeight: FontWeight.w700,
+                        fontSize: 14,
+                      ),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      subtitle,
+                      style: const TextStyle(
+                        color: Colors.white54,
+                        fontSize: 12,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  String get _focalMmLabel {
+    if ((_simFocalMm - _simFocalMm.round()).abs() < 0.05) {
+      return '${_simFocalMm.round()} mm';
+    }
+    return '${_simFocalMm.toStringAsFixed(1)} mm';
+  }
+
+  String get _focalTileValue {
+    final body = _body;
+    if (body != null && !body.interchangeableLenses) {
+      return _focalMmLabel;
+    }
+    final lens = _selectedLens;
+    if (lens != null) return '$_focalMmLabel · ${lens.name}';
+    return '$_focalMmLabel · Free';
+  }
+
+  void _toggleFocalDial() {
+    if (_focalDialOpen) {
+      _closeFocalDial();
+    } else {
+      _openFocalDial();
+    }
+  }
+
+  Future<void> _onFocalPressed() async {
+    final body = _body;
+    // Fixed-lens bodies only adjust the viewfinder focal simulation.
+    if (body != null && !body.interchangeableLenses) {
+      _toggleFocalDial();
+      return;
+    }
+    // Interchangeable (or unknown body): pick free zoom / a catalogued lens.
+    if (_availableLenses.isNotEmpty) {
+      await _pickFocalLens();
+      return;
+    }
+    await _selectFreeZoom(openDial: true);
+  }
+
+  Future<void> _pickFocalLens() async {
+    final chosen = await _whileModalOpen(() {
+      return showModalBottomSheet<Object>(
+        context: context,
+        backgroundColor: const Color(0xFF161616),
+        isScrollControlled: true,
+        shape: const RoundedRectangleBorder(
+          borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+        ),
+        builder: (ctx) {
+          final freeSelected = _selectedLens == null;
+          return SafeArea(
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(16, 16, 16, 16),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  const Text(
+                    'Focal',
+                    style: TextStyle(
+                      fontSize: 16,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    _film.cameraLabel ?? 'Free zoom or a lens for this body',
+                    style: const TextStyle(fontSize: 13, color: Colors.white54),
+                  ),
+                  const SizedBox(height: 8),
+                  ConstrainedBox(
+                    constraints: BoxConstraints(
+                      maxHeight: MediaQuery.sizeOf(ctx).height * 0.5,
+                    ),
+                    child: ListView.separated(
+                      shrinkWrap: true,
+                      itemCount: 1 + _availableLenses.length,
+                      separatorBuilder: (_, _) => const Divider(
+                        height: 1,
+                        color: Colors.white10,
+                      ),
+                      itemBuilder: (context, index) {
+                        if (index == 0) {
+                          return ListTile(
+                            contentPadding: EdgeInsets.zero,
+                            title: Text(
+                              'Free zoom',
+                              style: TextStyle(
+                                color: freeSelected ? _accent : Colors.white,
+                                fontWeight: freeSelected
+                                    ? FontWeight.w800
+                                    : FontWeight.w600,
+                              ),
+                            ),
+                            subtitle: const Text(
+                              'Any focal length · full aperture range',
+                              style: TextStyle(
+                                color: Colors.white38,
+                                fontSize: 12,
+                              ),
+                            ),
+                            trailing: freeSelected
+                                ? const Icon(
+                                    Icons.check,
+                                    color: _accent,
+                                    size: 20,
+                                  )
+                                : null,
+                            onTap: () => Navigator.pop(ctx, _freeZoomChoice),
+                          );
+                        }
+                        final lens = _availableLenses[index - 1];
+                        final selected = _selectedLens?.id == lens.id;
+                        return ListTile(
+                          contentPadding: EdgeInsets.zero,
+                          title: Text(
+                            '${lens.brand} ${lens.name}',
+                            style: TextStyle(
+                              color: selected ? _accent : Colors.white,
+                              fontWeight:
+                                  selected ? FontWeight.w800 : FontWeight.w600,
+                            ),
+                          ),
+                          subtitle: Text(
+                            lens.summary,
+                            style: const TextStyle(
+                              color: Colors.white38,
+                              fontSize: 12,
+                            ),
+                          ),
+                          trailing: selected
+                              ? const Icon(
+                                  Icons.check,
+                                  color: _accent,
+                                  size: 20,
+                                )
+                              : null,
+                          onTap: () => Navigator.pop(ctx, lens),
+                        );
+                      },
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          );
+        },
+      );
+    });
+
+    if (chosen == null || !mounted) return;
+
+    if (identical(chosen, _freeZoomChoice)) {
+      await _selectFreeZoom(openDial: true);
+      return;
+    }
+    if (chosen is UserLens) {
+      await _selectLens(chosen, openDial: true);
+    }
+  }
+
+  Future<void> _selectFreeZoom({bool openDial = false}) async {
+    final updated = _film.copyWith(clearLens: true);
+    setState(() {
+      _selectedLens = null;
+      _film = updated;
+      _clampExposureToGear();
+    });
+    await FilmStockStore.upsertSelected(updated);
+    if (!mounted) return;
+    if (openDial) _openFocalDial();
+  }
+
+  Future<void> _selectLens(UserLens chosen, {bool openDial = false}) async {
+    final updated = _film.copyWith(
+      lensId: chosen.id,
+      lensLabel: '${chosen.brand} ${chosen.name}',
+    );
+    setState(() {
+      _selectedLens = chosen;
+      _film = updated;
+      _simFocalMm = _clampFocalToLens(chosen, _simFocalMm);
+      _clampExposureToGear();
+    });
+    await FilmStockStore.upsertSelected(updated);
+    if (!mounted) return;
+    // Primes are a single stop — no dial needed.
+    if (openDial && chosen.isZoom && chosen.maxFocalMm != null) {
+      _openFocalDial();
+    } else if (openDial && !chosen.isZoom) {
+      _closeFocalDial();
+    }
+  }
+
   Future<void> _pickAperture() async {
+    final items = _availableApertures;
     final chosen = await _showWheelPicker<double>(
       title: 'Aperture',
-      items: ExposureMath.standardApertures,
+      items: items,
       initial: _aperture,
       labelOf: ExposureMath.formatAperture,
     );
@@ -1532,9 +2405,10 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
   }
 
   Future<void> _pickShutter() async {
+    final items = _availableShutters;
     final chosen = await _showWheelPicker<double>(
       title: 'Shutter speed',
-      items: ExposureMath.standardShutters,
+      items: items,
       initial: _shutter,
       labelOf: ExposureMath.formatShutter,
     );
@@ -1553,6 +2427,16 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
     required String Function(T) labelOf,
   }) {
     var index = items.indexOf(initial);
+    if (index < 0 && initial is double) {
+      // Match shutter/aperture floats that aren't identical by identity.
+      for (var i = 0; i < items.length; i++) {
+        final item = items[i];
+        if (item is double && (item - initial).abs() < 1e-12) {
+          index = i;
+          break;
+        }
+      }
+    }
     if (index < 0) index = 0;
 
     return _whileModalOpen(
@@ -1759,4 +2643,25 @@ class _SpotPainter extends CustomPainter {
   @override
   bool shouldRepaint(covariant _SpotPainter old) =>
       point != old.point || color != old.color || radius != old.radius;
+}
+
+enum _TungstenMeterChoice {
+  tungstenRated,
+  daylight85,
+  changeBoxSpeed,
+}
+
+/// EC tick display: exact solve, snapped gear value, optional limit label.
+class _CompResult {
+  const _CompResult({
+    required this.exactLabel,
+    required this.snappedLabel,
+    this.limitLabel,
+  });
+
+  final String exactLabel;
+  final String snappedLabel;
+
+  /// `over` / `under` when the exact solve is outside camera/lens range.
+  final String? limitLabel;
 }

@@ -30,6 +30,44 @@ void main() {
     });
   });
 
+  group('Hasselblad lens EV', () {
+    test('f/16 at 1/125 is lens EV ≈ 15', () {
+      // log2(256 / (1/125)) = log2(32000) ≈ 14.97
+      final ev = ExposureMath.lensEv(
+        aperture: 16,
+        shutterSeconds: 1 / 125,
+      );
+      expect(ev, closeTo(15.0, 0.05));
+    });
+
+    test('lens EV at ISO 400 is EV₁₀₀ + 2', () {
+      expect(
+        ExposureMath.lensEvFromEv100(ev100: 15, iso: 400),
+        closeTo(17.0, 1e-9),
+      );
+      expect(
+        ExposureMath.ev100FromLensEv(lensEv: 17, iso: 400),
+        closeTo(15.0, 1e-9),
+      );
+    });
+
+    test('shutter from lens EV matches EV₁₀₀ solve at that ISO', () {
+      const lensEv = 15.0;
+      const aperture = 8.0;
+      const iso = 400;
+      final fromLens = ExposureMath.shutterFromLensEv(
+        lensEv: lensEv,
+        aperture: aperture,
+      );
+      final fromEv100 = ExposureMath.shutterFromEv(
+        ev100: ExposureMath.ev100FromLensEv(lensEv: lensEv, iso: iso),
+        aperture: aperture,
+        iso: iso,
+      );
+      expect(fromLens, closeTo(fromEv100, 1e-12));
+    });
+  });
+
   group('camera exposure → EV', () {
     test('EV₁₀₀ of a known exposure', () {
       // f/16, 1/128s, ISO 100 is EV 15.

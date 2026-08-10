@@ -1,30 +1,81 @@
 import 'package:flutter/material.dart';
 
 import 'add_film_page.dart';
+import 'camera_picker.dart';
+import 'exposure.dart';
 import 'film_format.dart';
 import 'film_icon.dart';
 import 'film_stock.dart';
+import 'gear.dart';
 
 const Color _accent = Color(0xFFFFB300);
 
 /// Catalog of popular stocks. Returns the chosen [FilmStock] via [Navigator.pop].
+///
+/// When [cameraPick] is set (camera-first flow), films are filtered to that
+/// body's roll size and the camera is attached without asking again.
 class FilmSelectPage extends StatefulWidget {
-  const FilmSelectPage({super.key});
+  const FilmSelectPage({super.key, this.cameraPick});
+
+  final CameraPick? cameraPick;
 
   @override
   State<FilmSelectPage> createState() => _FilmSelectPageState();
 }
 
+/// Brand chip: null = all still+movie; [_movieBrandSentinel] = Movie group.
+const Object _movieBrandSentinel = Object();
+
 class _FilmSelectPageState extends State<FilmSelectPage> {
   FilmType? _formatFilter; // null = all
   FilmCategory? _categoryFilter; // null = all
+  /// `null` = all brands, [FilmBrand] = that brand (still only), movie sentinel = cinema.
+  Object? _brandFilter;
+
+  UserCamera? get _camera => widget.cameraPick?.camera;
+
+  @override
+  void initState() {
+    super.initState();
+    final cam = _camera;
+    if (cam != null) {
+      _formatFilter = cam.filmType;
+    }
+  }
 
   List<FilmCatalogEntry> get _visibleFilms {
-    return PopularFilms.catalog.where((f) {
+    final films = PopularFilms.catalog.where((f) {
       if (_formatFilter != null && !f.offers(_formatFilter!)) return false;
       if (_categoryFilter != null && f.category != _categoryFilter) return false;
+      if (identical(_brandFilter, _movieBrandSentinel)) {
+        if (!f.motionPicture) return false;
+      } else if (_brandFilter is FilmBrand) {
+        if (f.motionPicture || f.brand != _brandFilter) return false;
+      }
       return true;
     }).toList();
+
+    int brandRank(FilmCatalogEntry f) {
+      if (f.motionPicture) return 100;
+      const order = [
+        FilmBrand.kodak,
+        FilmBrand.fujifilm,
+        FilmBrand.ilford,
+        FilmBrand.cinestill,
+        FilmBrand.other,
+      ];
+      final i = order.indexOf(f.brand);
+      return i < 0 ? 50 : i;
+    }
+
+    films.sort((a, b) {
+      final byBrand = brandRank(a).compareTo(brandRank(b));
+      if (byBrand != 0) return byBrand;
+      final byCat = a.category.index.compareTo(b.category.index);
+      if (byCat != 0) return byCat;
+      return a.name.compareTo(b.name);
+    });
+    return films;
   }
 
   Future<void> _select(FilmCatalogEntry entry) async {
@@ -96,19 +147,40 @@ class _FilmSelectPageState extends State<FilmSelectPage> {
     if (type == null || !mounted) return;
 
     FilmFormat? frameFormat;
+    final cam = _camera;
     if (type == FilmType.thirtyFive) {
       frameFormat = FilmFormat.thirtyFive;
+    } else if (type == FilmType.instax) {
+      frameFormat = await _pickFrameFormat(
+        entry.name,
+        options: FilmFormat.instaxFormats,
+        subtitle: 'Mini or Square — same film, different size',
+      );
+      if (frameFormat == null || !mounted) return;
+    } else if (cam != null && !cam.changeableBack) {
+      frameFormat = cam.format;
     } else {
-      frameFormat = await _pick120FrameFormat(entry.name);
+      frameFormat = await _pickFrameFormat(
+        entry.name,
+        options: const [FilmFormat.sixFourFive, FilmFormat.sixBySix],
+      );
       if (frameFormat == null || !mounted) return;
     }
 
-    Navigator.of(context).pop(entry.toStock(type, frameFormat: frameFormat));
+    var stock = entry.toStock(type, frameFormat: frameFormat);
+    final pick = widget.cameraPick;
+    if (pick != null) {
+      stock = filmWithCamera(stock, pick);
+    }
+    Navigator.of(context).pop(stock);
   }
 
-  /// 120 rolls shoot either 645 or 6×6 — pick once when loading the film.
-  Future<FilmFormat?> _pick120FrameFormat(String filmName) {
-    const options = [FilmFormat.sixFourFive, FilmFormat.sixBySix];
+  /// Pick a frame / pack size once when loading the film.
+  Future<FilmFormat?> _pickFrameFormat(
+    String filmName, {
+    required List<FilmFormat> options,
+    String subtitle = 'Choose frame size',
+  }) {
     return showModalBottomSheet<FilmFormat>(
       context: context,
       backgroundColor: const Color(0xFF161616),
@@ -130,9 +202,9 @@ class _FilmSelectPageState extends State<FilmSelectPage> {
                 ),
               ),
               const SizedBox(height: 4),
-              const Text(
-                'Choose frame size',
-                style: TextStyle(fontSize: 13, color: Colors.white54),
+              Text(
+                subtitle,
+                style: const TextStyle(fontSize: 13, color: Colors.white54),
               ),
               const SizedBox(height: 16),
               Row(
@@ -171,26 +243,58 @@ class _FilmSelectPageState extends State<FilmSelectPage> {
       MaterialPageRoute(builder: (_) => const AddFilmPage()),
     );
     if (film == null || !mounted) return;
+
+    final pick = widget.cameraPick;
+    if (pick != null) {
+      Navigator.of(context).pop(filmWithCamera(film, pick));
+      return;
+    }
+
     Navigator.of(context).pop(film);
   }
 
   @override
   Widget build(BuildContext context) {
+    final cam = _camera;
     return Scaffold(
       backgroundColor: const Color(0xFF0A0A0A),
       appBar: AppBar(
         backgroundColor: const Color(0xFF0A0A0A),
         foregroundColor: Colors.white,
         elevation: 0,
-        title: const Text(
-          'Select film',
-          style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
+        title: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              'Select film',
+              style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
+            ),
+            if (cam != null)
+              Text(
+                cameraDisplayName(cam),
+                style: const TextStyle(
+                  fontSize: 12,
+                  fontWeight: FontWeight.w400,
+                  color: Colors.white54,
+                ),
+              )
+            else if (widget.cameraPick != null)
+              const Text(
+                'No camera',
+                style: TextStyle(
+                  fontSize: 12,
+                  fontWeight: FontWeight.w400,
+                  color: Colors.white54,
+                ),
+              ),
+          ],
         ),
       ),
       body: SafeArea(
         child: Column(
           children: [
-            _buildFormatBar(),
+            if (cam == null) _buildFormatBar(),
+            _buildBrandBar(),
             _buildCategoryBar(),
             Expanded(child: _buildFilmList()),
           ],
@@ -224,6 +328,50 @@ class _FilmSelectPageState extends State<FilmSelectPage> {
             label: '120',
             onTap: () => setState(() => _formatFilter = FilmType.oneTwenty),
           ),
+          const SizedBox(width: 8),
+          _chip(
+            selected: _formatFilter == FilmType.instax,
+            label: 'Instax',
+            onTap: () => setState(() => _formatFilter = FilmType.instax),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildBrandBar() {
+    const brands = <FilmBrand>[
+      FilmBrand.kodak,
+      FilmBrand.fujifilm,
+      FilmBrand.ilford,
+      FilmBrand.cinestill,
+    ];
+    return Container(
+      height: 44,
+      color: const Color(0xFF0A0A0A),
+      child: ListView(
+        scrollDirection: Axis.horizontal,
+        padding: const EdgeInsets.fromLTRB(10, 4, 10, 4),
+        children: [
+          _chip(
+            selected: _brandFilter == null,
+            label: 'All brands',
+            onTap: () => setState(() => _brandFilter = null),
+          ),
+          for (final brand in brands) ...[
+            const SizedBox(width: 8),
+            _chip(
+              selected: _brandFilter == brand,
+              label: brand.label,
+              onTap: () => setState(() => _brandFilter = brand),
+            ),
+          ],
+          const SizedBox(width: 8),
+          _chip(
+            selected: identical(_brandFilter, _movieBrandSentinel),
+            label: 'Movie',
+            onTap: () => setState(() => _brandFilter = _movieBrandSentinel),
+          ),
         ],
       ),
     );
@@ -235,7 +383,7 @@ class _FilmSelectPageState extends State<FilmSelectPage> {
       color: const Color(0xFF0A0A0A),
       child: ListView(
         scrollDirection: Axis.horizontal,
-        padding: const EdgeInsets.fromLTRB(10, 4, 10, 6),
+        padding: const EdgeInsets.fromLTRB(10, 0, 10, 6),
         children: [
           _chip(
             selected: _categoryFilter == null,
@@ -287,16 +435,30 @@ class _FilmSelectPageState extends State<FilmSelectPage> {
     final entries = <_ListEntry>[_ListEntry.custom()];
     final films = _visibleFilms;
 
-    if (_categoryFilter != null) {
-      for (final film in films) {
-        entries.add(_ListEntry.film(film));
+    if (_brandFilter != null) {
+      // Single brand / Movie chip — optional type headers only.
+      if (_categoryFilter != null) {
+        for (final film in films) {
+          entries.add(_ListEntry.film(film));
+        }
+      } else {
+        FilmCategory? lastCategory;
+        for (final film in films) {
+          if (film.category != lastCategory) {
+            entries.add(_ListEntry.header(film.category.label));
+            lastCategory = film.category;
+          }
+          entries.add(_ListEntry.film(film));
+        }
       }
     } else {
-      FilmCategory? lastCategory;
+      // All brands — group Kodak / Fuji / … / Movie.
+      String? lastBrand;
       for (final film in films) {
-        if (film.category != lastCategory) {
-          entries.add(_ListEntry.header(film.category.label));
-          lastCategory = film.category;
+        final label = film.brandGroupLabel;
+        if (label != lastBrand) {
+          entries.add(_ListEntry.header(label));
+          lastBrand = label;
         }
         entries.add(_ListEntry.film(film));
       }
@@ -463,7 +625,13 @@ class _CatalogFilmTile extends StatelessWidget {
                     ),
                     const SizedBox(height: 2),
                     Text(
-                      'ISO ${entry.iso}  ·  $_formatsLabel',
+                      entry.resolvedBalance == FilmBalance.tungsten
+                          ? 'ISO ${entry.iso} T  ·  '
+                              '+85 → EI ${ExposureMath.eiWithWratten85(entry.iso)}  ·  '
+                              '$_formatsLabel'
+                          : 'ISO ${entry.iso}  ·  $_formatsLabel',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
                       style: const TextStyle(
                         color: Colors.white54,
                         fontSize: 12,
