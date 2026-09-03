@@ -207,6 +207,7 @@ class AlbumShotStore {
                 ? Map<String, dynamic>.from(item)
                 : null;
         if (map == null) continue;
+        if (map['iso'] is num) map['iso'] = (map['iso'] as num).toInt();
         var shot = AlbumShot.fromJson(map);
         if (shot == null) continue;
         if (!await File(shot.imagePath).exists()) continue;
@@ -221,6 +222,53 @@ class AlbumShotStore {
     } catch (_) {
       return [];
     }
+  }
+
+  /// All album rows from meta, including shots whose JPEG is missing.
+  static Future<List<AlbumShot>> loadAllMeta() async {
+    try {
+      final file = await _metaFile();
+      if (!await file.exists()) return [];
+      final data = jsonDecode(await file.readAsString());
+      if (data is! List) return [];
+      final shots = <AlbumShot>[];
+      for (final item in data) {
+        final Map<String, dynamic>? map = item is Map<String, dynamic>
+            ? item
+            : item is Map
+                ? Map<String, dynamic>.from(item)
+                : null;
+        if (map == null) continue;
+        if (map['iso'] is num) map['iso'] = (map['iso'] as num).toInt();
+        final shot = AlbumShot.fromJson(map);
+        if (shot != null) shots.add(shot);
+      }
+      return shots;
+    } catch (_) {
+      return [];
+    }
+  }
+
+  /// Public album directory (JPEG files).
+  static Future<Directory> albumDirectory() => _albumDir();
+
+  /// Rewrite image paths into the current album folder and replace meta.
+  static Future<void> restoreMeta(List<AlbumShot> shots) async {
+    final dir = await _albumDir();
+    final rewritten = <AlbumShot>[];
+    for (final s in shots) {
+      final name = s.imagePath.replaceAll('\\', '/').split('/').last;
+      final path = '${dir.path}${Platform.pathSeparator}$name';
+      String? scan;
+      final rawScan = s.scanImagePath;
+      if (rawScan != null && rawScan.isNotEmpty) {
+        final scanName = rawScan.replaceAll('\\', '/').split('/').last;
+        scan = '${dir.path}${Platform.pathSeparator}$scanName';
+      }
+      rewritten.add(s.copyWith(imagePath: path, scanImagePath: scan));
+    }
+    await _saveAll(rewritten);
+    _notifyChanged();
   }
 
   static Future<void> _saveAll(List<AlbumShot> shots) async {

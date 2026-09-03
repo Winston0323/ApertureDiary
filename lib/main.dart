@@ -152,6 +152,9 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
   double? _ev;
   double _calibration = 0.0;
 
+  /// Smoothed correlated colour temperature (Kelvin) of the metered patch.
+  double? _cctKelvin;
+
   /// Hasselblad / Compur orange-scale EV at the current metering EI.
   double? get _lensEv {
     final ev100 = _ev;
@@ -164,6 +167,8 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
 
   bool _measuring = false;
   bool _saving = false;
+  /// When true, freeze the current EV (and WB-driven EI) until unlocked.
+  bool _exposureLocked = false;
   /// Inline status to the left of the shutter (replaces save SnackBars).
   String? _captureHint;
   bool _captureHintError = false;
@@ -207,18 +212,24 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
   /// EI used for EV / shutter / aperture solves.
   int get _meterIso {
     if (_film.isTungsten && _daylight85) {
-      return ExposureMath.eiWithWratten85(_iso);
+      return ExposureMath.eiForTungstenScene(
+        tungstenIso: _iso,
+        sceneKelvin: _cctKelvin,
+      );
     }
     return _iso;
   }
 
   String get _isoChipLabel {
-    if (_film.isTungsten && _daylight85) return 'EI $_meterIso';
+    if (_film.isTungsten && _daylight85 && _meterIso != _iso) {
+      return 'EI $_meterIso';
+    }
     return 'ISO $_iso';
   }
 
   String get _isoSubtitle {
     if (_film.isTungsten && _daylight85) {
+      if (_meterIso == _iso) return 'ISO $_iso T';
       return 'EI $_meterIso +85';
     }
     if (_film.isTungsten) return 'ISO $_iso T';
@@ -231,6 +242,19 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
 
   /// Focal-length viewfinder simulation — format is locked by the loaded roll.
   FilmFormat get _simFormat => _film.frameFormat;
+
+  /// Outer viewfinder FOV. 645 rolls show the 6×6 square FOV with a 645 gate.
+  FilmFormat get _viewfinderFormat =>
+      _simFormat == FilmFormat.sixFourFive
+          ? FilmFormat.sixBySix
+          : _simFormat;
+
+  bool get _is645InSixBySix => _simFormat == FilmFormat.sixFourFive;
+
+  /// 645 gate height inside a 6×6 opening (same width, shorter gate).
+  static double get _gate645HeightFrac =>
+      FilmFormat.sixFourFive.heightMm / FilmFormat.sixBySix.heightMm;
+
   late double _simFocalMm = _simFormat.defaultFocalMm;
   LensInfo? _lensInfo;
 
@@ -526,7 +550,7 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
           _failedMeasurements = 0;
           _params = params;
           _ev = null; // Recomputed from the next frame.
-          _status = 'Exposure locked';
+          _status = _exposureLocked ? 'AE-L' : 'Exposure locked';
         }
       });
     } catch (e) {
@@ -556,11 +580,11 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
     return parseExposureParams(tags);
   }
 
-  /// Centre-crop fraction for the current format + focal simulation.
+  /// Centre-crop fraction for the viewfinder FOV + focal simulation.
   double get _simCrop {
     final lens = _lensInfo;
     if (lens == null || !lens.isUsable) return 1.0;
-    return lens.cropForFormat(_simFormat, _simFocalMm, 1.0);
+    return lens.cropForFormat(_viewfinderFormat, _simFocalMm, 1.0);
   }
 
   bool get _simLimited => _simCrop >= 0.999;
@@ -617,7 +641,10 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
     // Persist the Hasselblad lens-scale EV the user sees, at this film ISO.
     final ev = _lensEv;
     final cropFraction = _simCrop;
-    final cropAspectRatio = _simFormat.aspectRatio;
+    // 645 is framed inside a 6×6 FOV square; capture matches that gate.
+    final cropAspectRatio = _viewfinderFormat.aspectRatio;
+    final insetWidthFrac = _is645InSixBySix ? 1.0 : null;
+    final insetHeightFrac = _is645InSixBySix ? _gate645HeightFrac : null;
 
     setState(() {
       _saving = true;
@@ -664,6 +691,8 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
         ev: ev,
         cropFraction: cropFraction,
         cropAspectRatio: cropAspectRatio,
+        insetWidthFrac: insetWidthFrac,
+        insetHeightFrac: insetHeightFrac,
       ),
     );
   }
@@ -680,12 +709,16 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
     required double? ev,
     required double cropFraction,
     required double cropAspectRatio,
+    double? insetWidthFrac,
+    double? insetHeightFrac,
   }) async {
     try {
       final bytes = await cropFilmJpegInBackground(
         jpegBytes: jpeg,
         cropFraction: cropFraction,
         cropAspectRatio: cropAspectRatio,
+        insetWidthFrac: insetWidthFrac,
+        insetHeightFrac: insetHeightFrac,
       );
       await AlbumShotStore.add(
         jpegBytes: bytes,
@@ -845,7 +878,7 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
       _sample = sample;
 
       final params = _params;
-      if (params != null) {
+      if (params != null && (!_exposureLocked || _ev == null)) {
         final raw = ExposureMath.sceneEv(
               cameraEv100: params.ev100,
               linearLuminance: sample.linearLuminance,
@@ -856,7 +889,14 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
         _ev = previous == null ? raw : previous + (raw - previous) * 0.35;
       }
 
-      if (!_measuringDistance) {
+      final cct = sample.cctKelvin;
+      if (cct != null && (!_exposureLocked || _cctKelvin == null)) {
+        final previous = _cctKelvin;
+        _cctKelvin =
+            previous == null ? cct : previous + (cct - previous) * 0.35;
+      }
+
+      if (!_measuringDistance && !_exposureLocked) {
         _maybeAutoMeter(sample);
       }
 
@@ -936,7 +976,9 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
   /// patch clips or crushes, the tone curve stops being invertible and the
   /// reading would drift.
   void _maybeAutoMeter(SpotSample sample) {
-    if (_measuring || _modalOpen || _failedMeasurements >= 3) return;
+    if (_exposureLocked || _measuring || _modalOpen || _failedMeasurements >= 3) {
+      return;
+    }
     final last = _lastMeasuredAt;
     if (last != null && DateTime.now().difference(last) < _autoMeterCooldown) {
       return;
@@ -961,6 +1003,7 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
         (local.dy / h).clamp(0.0, 1.0),
       );
       _ev = null;
+      _cctKelvin = null;
     });
     if (wasMeasuringDistance) {
       // Retarget: stop current session and lock the new point next frame.
@@ -978,6 +1021,7 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
     setState(() {
       _meterPoint = const Offset(0.5, 0.5);
       _ev = null;
+      _cctKelvin = null;
     });
     _measure();
   }
@@ -1134,6 +1178,13 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
     return 'Full sun';
   }
 
+  String get _whiteBalanceLabel {
+    final k = _cctKelvin;
+    if (k == null) return 'WB —';
+    final rounded = (k / 50).round() * 50;
+    return '${rounded}K';
+  }
+
   // ---------------------------------------------------------------------- UI
 
   @override
@@ -1144,12 +1195,17 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
         backgroundColor: const Color(0xFF0A0A0A),
         foregroundColor: Colors.white,
         elevation: 0,
+        toolbarHeight: 64,
+        titleSpacing: 0,
         title: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
           children: [
             Text(
               _film.name,
-              style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(fontSize: 17, fontWeight: FontWeight.w600),
             ),
             Text(
               [
@@ -1157,42 +1213,64 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
                 _isoSubtitle,
                 if (_film.cameraLabel != null) _film.cameraLabel!,
               ].join('  ·  '),
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
               style: const TextStyle(fontSize: 11, color: Colors.white54),
             ),
           ],
         ),
-        actions: [
-          TextButton.icon(
-            onPressed: _pickIso,
-            icon: const Icon(Icons.edit_outlined, size: 16, color: _accent),
-            label: Text(
-              _isoChipLabel,
-              style: const TextStyle(
-                color: _accent,
-                fontWeight: FontWeight.w800,
-                fontSize: 13,
-              ),
+        bottom: PreferredSize(
+          preferredSize: const Size.fromHeight(44),
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(4, 0, 4, 4),
+            child: Row(
+              children: [
+                TextButton.icon(
+                  onPressed: _pickIso,
+                  style: TextButton.styleFrom(
+                    padding: const EdgeInsets.symmetric(horizontal: 8),
+                    minimumSize: const Size(0, 36),
+                    tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                  ),
+                  icon: const Icon(
+                    Icons.edit_outlined,
+                    size: 16,
+                    color: _accent,
+                  ),
+                  label: Text(
+                    _isoChipLabel,
+                    style: const TextStyle(
+                      color: _accent,
+                      fontWeight: FontWeight.w800,
+                      fontSize: 13,
+                    ),
+                  ),
+                ),
+                const Spacer(),
+                IconButton(
+                  tooltip: _measuringDistance
+                      ? 'Cancel measure'
+                      : 'Measure distance',
+                  icon: Icon(
+                    _measuringDistance
+                        ? Icons.close
+                        : Icons.straighten_outlined,
+                  ),
+                  onPressed: !_isInitialized
+                      ? null
+                      : (_measuringDistance
+                          ? _cancelDistanceMeasure
+                          : _requestDistanceMeasure),
+                ),
+                IconButton(
+                  tooltip: 'Flash',
+                  icon: const Icon(Icons.flash_on),
+                  onPressed: _isInitialized ? _openFlash : null,
+                ),
+              ],
             ),
           ),
-          IconButton(
-            tooltip: _measuringDistance ? 'Cancel measure' : 'Measure distance',
-            icon: Icon(
-              _measuringDistance
-                  ? Icons.close
-                  : Icons.straighten_outlined,
-            ),
-            onPressed: !_isInitialized
-                ? null
-                : (_measuringDistance
-                    ? _cancelDistanceMeasure
-                    : _requestDistanceMeasure),
-          ),
-          IconButton(
-            tooltip: 'Flash',
-            icon: const Icon(Icons.flash_on),
-            onPressed: _isInitialized ? _openFlash : null,
-          ),
-        ],
+        ),
       ),
       body: SafeArea(
         top: false,
@@ -1283,7 +1361,7 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
               final fitted = FilmOptics.fitAspect(
                 maxWidth: constraints.maxWidth,
                 maxHeight: constraints.maxHeight,
-                aspect: _simFormat.aspectRatio,
+                aspect: _viewfinderFormat.aspectRatio,
               );
               final viewSize = Size(fitted.width, fitted.height);
               _previewSize = viewSize;
@@ -1328,6 +1406,9 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
                                 painter: _FilmFramePainter(
                                   color: _accent,
                                   showThirds: true,
+                                  // 645: square 6×6 FOV with real 645 gate.
+                                  gateHeightFrac:
+                                      _is645InSixBySix ? _gate645HeightFrac : null,
                                 ),
                               ),
                             ),
@@ -1349,6 +1430,10 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
                                 crossAxisAlignment: CrossAxisAlignment.start,
                                 children: [
                                   _statusChip(),
+                                  if (_is645InSixBySix) ...[
+                                    const SizedBox(height: 6),
+                                    _chip('6×6 FOV · 645 gate'),
+                                  ],
                                   if (_subjectDistanceM != null &&
                                       !_measuringDistance) ...[
                                     const SizedBox(height: 6),
@@ -1369,6 +1454,11 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
                                   ],
                                 ],
                               ),
+                            ),
+                            Positioned(
+                              bottom: 8,
+                              left: 8,
+                              child: _chip(_whiteBalanceLabel),
                             ),
                             if (!_focalDialOpen)
                               Positioned(
@@ -1526,6 +1616,8 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
                     ),
                     const SizedBox(width: 10),
                   ],
+                  _exposureLockButton(),
+                  const SizedBox(width: 10),
                   _shutterButton(),
                 ],
               ),
@@ -1534,6 +1626,77 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
         ],
       ),
     );
+  }
+
+  Widget _exposureLockButton() {
+    final locked = _exposureLocked;
+    return GestureDetector(
+      onTap: (_saving || _measuring) ? null : _toggleExposureLock,
+      child: AnimatedOpacity(
+        opacity: (_saving || _measuring) ? 0.45 : 1,
+        duration: const Duration(milliseconds: 150),
+        child: Container(
+          height: 36,
+          padding: const EdgeInsets.symmetric(horizontal: 8),
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(18),
+            border: Border.all(
+              color: locked ? _accent : Colors.white54,
+              width: 1.5,
+            ),
+            color: locked ? _accent.withValues(alpha: 0.18) : Colors.transparent,
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(
+                locked ? Icons.lock : Icons.lock_open,
+                size: 15,
+                color: locked ? _accent : Colors.white70,
+              ),
+              const SizedBox(width: 4),
+              Text(
+                'AE-L',
+                style: TextStyle(
+                  color: locked ? _accent : Colors.white70,
+                  fontSize: 11,
+                  fontWeight: FontWeight.w800,
+                  letterSpacing: 0.4,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _toggleExposureLock() async {
+    if (_saving || _measuring) return;
+    if (_exposureLocked) {
+      setState(() {
+        _exposureLocked = false;
+        _status = 'Live meter';
+      });
+      return;
+    }
+    if (_ev == null) {
+      await _measure();
+      if (!mounted || _ev == null && _params == null) return;
+    }
+    if (!mounted) return;
+    setState(() {
+      _exposureLocked = true;
+      _status = 'AE-L';
+    });
+    final ctrl = _controller;
+    if (ctrl != null && ctrl.value.isInitialized) {
+      try {
+        await ctrl.setExposureMode(ExposureMode.locked);
+      } on CameraException {
+        // Reading is still held in [_ev] even if the camera cannot lock AE.
+      }
+    }
   }
 
   Widget _shutterButton() {
@@ -1701,8 +1864,8 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
           if (_meterDetailsOpen) ...[
             const SizedBox(height: 6),
             Text(
-              _film.isTungsten && _daylight85
-                  ? 'Lens EV (Hasselblad) at EI $_meterIso (daylight +85)'
+              _film.isTungsten && _daylight85 && _meterIso != _iso
+                  ? 'Lens EV (Hasselblad) at EI $_meterIso (85 / WB)'
                   : _film.isTungsten
                       ? 'Lens EV (Hasselblad) at ISO $_iso (tungsten)'
                       : 'Lens EV (Hasselblad) at ISO $_meterIso',
@@ -2029,7 +2192,18 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
   }
 
   Future<void> _pickTungstenMetering() async {
-    final daylightEi = ExposureMath.eiWithWratten85(_iso);
+    final daylightEi = ExposureMath.eiForTungstenScene(
+      tungstenIso: _iso,
+      sceneKelvin: ExposureMath.daylightBalanceKelvin,
+    );
+    final tungstenEi = ExposureMath.eiForTungstenScene(
+      tungstenIso: _iso,
+      sceneKelvin: ExposureMath.tungstenBalanceKelvin,
+    );
+    final mixedEi = ExposureMath.eiForTungstenScene(
+      tungstenIso: _iso,
+      sceneKelvin: 4000,
+    );
     final choice = await _whileModalOpen(() {
       return showModalBottomSheet<_TungstenMeterChoice>(
         context: context,
@@ -2055,9 +2229,11 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
                   ),
                   const SizedBox(height: 6),
                   Text(
-                    'Rated ISO $_iso under tungsten. In daylight with an 85 '
-                    'filter, Kodak rates EI $daylightEi (−⅔ stop). '
-                    'Daylight without 85: keep ISO $_iso (expect a cool cast).',
+                    '5219 / 500T: meter a third slower than box, then add '
+                    '85-filter loss as Kelvin rises. '
+                    '3200 K → EI $tungstenEi, 4000 K → EI $mixedEi, '
+                    '5500 K → EI $daylightEi. '
+                    'Unfiltered daylight: keep ISO $_iso (cool cast).',
                     style: const TextStyle(
                       color: Colors.white54,
                       fontSize: 12,
@@ -2068,7 +2244,7 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
                   _tungstenMeterTile(
                     selected: !_daylight85,
                     title: 'Tungsten / unfiltered',
-                    subtitle: 'Meter at ISO $_iso',
+                    subtitle: 'Always ISO $_iso, ignore Kelvin',
                     onTap: () => Navigator.pop(
                       ctx,
                       _TungstenMeterChoice.tungstenRated,
@@ -2077,8 +2253,10 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
                   const SizedBox(height: 8),
                   _tungstenMeterTile(
                     selected: _daylight85,
-                    title: 'Daylight + 85 filter',
-                    subtitle: 'Meter at EI $daylightEi',
+                    title: '85 filter (follows WB)',
+                    subtitle: _cctKelvin == null
+                        ? 'EI $daylightEi at daylight until WB locks'
+                        : 'Now EI $_meterIso at ${_whiteBalanceLabel}',
                     onTap: () => Navigator.pop(
                       ctx,
                       _TungstenMeterChoice.daylight85,
@@ -2544,14 +2722,47 @@ class _FilmFramePainter extends CustomPainter {
   final Color color;
   final bool showThirds;
 
+  /// When set (e.g. 645 in a 6×6 square), draw this centred gate height
+  /// fraction with mask bars outside it. Width stays full.
+  final double? gateHeightFrac;
+
   _FilmFramePainter({
     required this.color,
     this.showThirds = true,
+    this.gateHeightFrac,
   });
 
   @override
   void paint(Canvas canvas, Size size) {
-    final frame = (Offset.zero & size).deflate(1);
+    final outer = (Offset.zero & size).deflate(1);
+    final gateFrac = gateHeightFrac;
+
+    late final Rect frame;
+    if (gateFrac != null && gateFrac > 0 && gateFrac < 1) {
+      final gateH = size.height * gateFrac.clamp(0.05, 1.0);
+      final top = (size.height - gateH) / 2;
+      frame = Rect.fromLTWH(1, top, size.width - 2, gateH);
+
+      // Dim the 6×6 areas outside the real 645 gate.
+      final mask = Paint()..color = Colors.black.withValues(alpha: 0.45);
+      canvas.drawRect(Rect.fromLTRB(0, 0, size.width, frame.top), mask);
+      canvas.drawRect(
+        Rect.fromLTRB(0, frame.bottom, size.width, size.height),
+        mask,
+      );
+
+      // Outer 6×6 outline.
+      canvas.drawRect(
+        outer,
+        Paint()
+          ..color = Colors.white24
+          ..strokeWidth = 1
+          ..style = PaintingStyle.stroke,
+      );
+    } else {
+      frame = outer;
+    }
+
     canvas.drawRect(
       frame,
       Paint()
@@ -2589,7 +2800,9 @@ class _FilmFramePainter extends CustomPainter {
 
   @override
   bool shouldRepaint(covariant _FilmFramePainter old) =>
-      color != old.color || showThirds != old.showThirds;
+      color != old.color ||
+      showThirds != old.showThirds ||
+      gateHeightFrac != old.gateHeightFrac;
 }
 
 class _SpotPainter extends CustomPainter {

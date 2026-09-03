@@ -203,4 +203,37 @@ void main() {
       expect(sample(0.6, 0.36).stopsFromMiddleGrey, closeTo(1.0, 1e-9));
     });
   });
+
+  group('cct from sRGB', () {
+    test('neutral grey is about D65', () {
+      final k = cctKelvinFromSrgb8(128, 128, 128);
+      expect(k, isNotNull);
+      expect(k!, closeTo(6500, 150));
+    });
+
+    test('warmer patches read lower kelvin', () {
+      final warm = cctKelvinFromSrgb8(220, 180, 140);
+      final cool = cctKelvinFromSrgb8(140, 180, 220);
+      expect(warm, isNotNull);
+      expect(cool, isNotNull);
+      expect(warm!, lessThan(4500));
+      expect(cool!, greaterThan(7500));
+      expect(warm, lessThan(cool!));
+    });
+
+    test('black has no CCT', () {
+      expect(cctKelvinFromSrgb8(0, 0, 0), isNull);
+    });
+
+    test('crushed spot sample skips CCT', () {
+      const crushed = SpotSample(
+        linearLuminance: 0.001,
+        encodedLuminance: 0.01,
+        r: 12,
+        g: 8,
+        b: 4,
+      );
+      expect(crushed.cctKelvin, isNull);
+    });
+  });
 }

@@ -188,4 +188,58 @@ void main() {
       expect(ExposureMath.formatStops(-0.5), '−0.5 EV');
     });
   });
+
+  group('tungsten EI from Kelvin', () {
+    test('500T at 3200 K is EI 400', () {
+      expect(
+        ExposureMath.eiForTungstenScene(
+          tungstenIso: 500,
+          sceneKelvin: 3200,
+        ),
+        400,
+      );
+    });
+
+    test('500T at 5500 K is EI 250', () {
+      expect(
+        ExposureMath.eiForTungstenScene(
+          tungstenIso: 500,
+          sceneKelvin: 5500,
+        ),
+        250,
+      );
+    });
+
+    test('500T at 4000 K is EI 320', () {
+      expect(
+        ExposureMath.eiForTungstenScene(
+          tungstenIso: 500,
+          sceneKelvin: 4000,
+        ),
+        320,
+      );
+    });
+
+    test('Kodak +85 catalog rating is unchanged', () {
+      expect(ExposureMath.eiWithWratten85(500), 320);
+      expect(ExposureMath.eiWithWratten85(800), 500);
+    });
+
+    test('warmer than 3200 K stays at the −⅓ floor', () {
+      expect(
+        ExposureMath.eiForTungstenScene(
+          tungstenIso: 500,
+          sceneKelvin: 2800,
+        ),
+        400,
+      );
+    });
+
+    test('unknown Kelvin assumes daylight EI 250', () {
+      expect(
+        ExposureMath.eiForTungstenScene(tungstenIso: 500),
+        250,
+      );
+    });
+  });
 }

@@ -78,7 +78,7 @@ class _HomePageState extends State<HomePage> {
       final messenger = ScaffoldMessenger.maybeOf(context);
       messenger?.showSnackBar(
         const SnackBar(
-          content: Text('Restored films & gear from backup'),
+          content: Text('Restored films, gear & album from backup'),
           behavior: SnackBarBehavior.floating,
         ),
       );
@@ -92,10 +92,11 @@ class _HomePageState extends State<HomePage> {
       SnackBar(
         content: Text(
           path != null
-              ? 'Backup saved to Downloads/ApertureDiary'
-              : 'Could not write backup',
+              ? 'Backup saved:\n$path'
+              : (AppDataBackup.lastError ?? 'Could not write backup'),
         ),
         behavior: SnackBarBehavior.floating,
+        duration: const Duration(seconds: 5),
       ),
     );
   }
@@ -107,18 +108,25 @@ class _HomePageState extends State<HomePage> {
       await _load();
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Backup restored'),
+        SnackBar(
+          content: Text(
+            AppDataBackup.lastMirrorPath == null
+                ? 'Backup restored'
+                : 'Restored from:\n${AppDataBackup.lastMirrorPath}',
+          ),
           behavior: SnackBarBehavior.floating,
+          duration: const Duration(seconds: 4),
         ),
       );
     } else {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
+        SnackBar(
           content: Text(
-            'No backup found in Downloads/ApertureDiary',
+            AppDataBackup.lastError ??
+                'No backup found in Downloads/ApertureDiary',
           ),
           behavior: SnackBarBehavior.floating,
+          duration: const Duration(seconds: 6),
         ),
       );
     }

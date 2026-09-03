@@ -310,12 +310,57 @@ class ExposureMath {
     ).round();
   }
 
+  /// Design CCT of tungsten (Type B / 500T) stocks.
+  static const double tungstenBalanceKelvin = 3200;
+
+  /// Design CCT of daylight stocks, and the 85-filter conversion target.
+  static const double daylightBalanceKelvin = 5500;
+
+  /// Wratten 85 light loss (−⅔ stop) when converting 5500 K → 3200 K.
+  static const double wratten85Stops = 2.0 / 3.0;
+
+  /// Personal tungsten curve: −⅓ stop at 3200 K, −1 stop at 5500 K.
+  static const double tungstenEiFloorStops = 1.0 / 3.0;
+  static const double tungstenEiDaylightStops = 1.0;
+
+  static double mired(double kelvin) => 1e6 / kelvin;
+
   /// Kodak-style EI under daylight with a Wratten 85 (−⅔ stop).
   ///
   /// Example: Vision3 500T → 320; CineStill 800T → 500.
   static int eiWithWratten85(int tungstenIso) {
     if (tungstenIso <= 0) return tungstenIso;
-    return snapIso(tungstenIso / pow(2.0, 2.0 / 3.0));
+    return snapIso(tungstenIso / pow(2.0, wratten85Stops));
+  }
+
+  /// Tungsten-stock EI from scene CCT (85-filter mode).
+  ///
+  /// For 500T / 5219: 3200 K → 400, 4000 K → 320, 5500 K → 250.
+  /// That's −⅓ stop at tungsten, interpolating in mireds to −1 stop in
+  /// daylight. Warmer than 3200 K stays at the −⅓ floor. Unknown Kelvin
+  /// assumes daylight.
+  static int eiForTungstenScene({
+    required int tungstenIso,
+    double? sceneKelvin,
+  }) {
+    if (tungstenIso <= 0) return tungstenIso;
+    if (sceneKelvin == null || !sceneKelvin.isFinite || sceneKelvin <= 0) {
+      return snapIso(tungstenIso / pow(2.0, tungstenEiDaylightStops));
+    }
+    final filmMired = mired(tungstenBalanceKelvin);
+    final sceneMired = mired(
+      sceneKelvin.clamp(2000.0, 15000.0),
+    );
+    final shift = filmMired - sceneMired;
+    if (shift <= 0) {
+      return snapIso(tungstenIso / pow(2.0, tungstenEiFloorStops));
+    }
+    final fullShift =
+        mired(tungstenBalanceKelvin) - mired(daylightBalanceKelvin);
+    final t = (shift / fullShift).clamp(0.0, 1.0);
+    final stops = tungstenEiFloorStops +
+        (tungstenEiDaylightStops - tungstenEiFloorStops) * t;
+    return snapIso(tungstenIso / pow(2.0, stops));
   }
 
   static const List<double> standardApertures = [

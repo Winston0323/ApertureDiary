@@ -159,6 +159,35 @@ class SpotSample {
   double get stopsFromMiddleGrey =>
       ExposureMath.log2(linearLuminance.clamp(1e-6, 1.0) /
           ExposureMath.middleGrey);
+
+  /// Correlated colour temperature of the patch, or null if too dark to trust.
+  double? get cctKelvin {
+    if (encodedLuminance < 0.04) return null;
+    return cctKelvinFromSrgb8(r, g, b);
+  }
+}
+
+/// McCamy CCT (Kelvin) from gamma-encoded 8-bit sRGB.
+///
+/// Valid roughly 2000–12500 K. Returns null for blacks or out-of-range xy.
+double? cctKelvinFromSrgb8(int r, int g, int b) {
+  final rl = ExposureMath.srgbLut[r.clamp(0, 255)];
+  final gl = ExposureMath.srgbLut[g.clamp(0, 255)];
+  final bl = ExposureMath.srgbLut[b.clamp(0, 255)];
+  // sRGB → CIE XYZ (D65).
+  final x = 0.4124564 * rl + 0.3575761 * gl + 0.1804375 * bl;
+  final y = 0.2126729 * rl + 0.7151522 * gl + 0.0721750 * bl;
+  final z = 0.0193339 * rl + 0.1191920 * gl + 0.9503041 * bl;
+  final sum = x + y + z;
+  if (sum < 1e-6) return null;
+  final cx = x / sum;
+  final cy = y / sum;
+  final denom = 0.1858 - cy;
+  if (denom.abs() < 1e-9) return null;
+  final n = (cx - 0.3320) / denom;
+  final cct = 449.0 * n * n * n + 3525.0 * n * n + 6823.3 * n + 5520.33;
+  if (!cct.isFinite) return null;
+  return cct.clamp(2000.0, 15000.0);
 }
 
 /// Where a tapped preview point lands in the camera frame's own pixel space.
