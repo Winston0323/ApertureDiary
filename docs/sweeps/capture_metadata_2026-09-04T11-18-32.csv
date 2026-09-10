@@ -1,0 +1,5 @@
+# ApertureDiary capture metadata probe
+# recorded: 2026-09-04T11:18:32.508709
+# available: false
+field,value
+note,"No events. Either the plugin is unforked, the CameraX internals moved, or the analyzer is not running."

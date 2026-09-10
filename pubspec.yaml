@@ -54,6 +54,15 @@ dev_dependencies:
   flutter_lints: ^6.0.0
   flutter_launcher_icons: ^0.14.4
 
+# CameraX gives no access to the Camera2 CaptureResult, so exposure has to be
+# read from a still capture — a different pipeline from the preview pixels it
+# gets combined with — and colour temperature has to be guessed from pixels that
+# auto white balance has already neutralised. The fork streams that metadata per
+# frame. See packages/camera_android_camerax/FORK.md.
+dependency_overrides:
+  camera_android_camerax:
+    path: packages/camera_android_camerax
+
 flutter_launcher_icons:
   android: true
   ios: true

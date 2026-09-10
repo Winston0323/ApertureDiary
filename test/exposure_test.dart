@@ -137,6 +137,37 @@ void main() {
           ExposureMath.sceneEv(cameraEv100: 10.0, linearLuminance: 0.0);
       expect(ev.isFinite, isTrue);
     });
+
+    test('luminance above diffuse white is not capped', () {
+      // 1.0 is diffuse white at the metered exposure, not a ceiling: a patch
+      // the camera overexposed sits above it. Capping there understated every
+      // bright reading by up to 1.6 EV on a real device sweep.
+      final white = ExposureMath.sceneEv(
+        cameraEv100: 10.0,
+        linearLuminance: 1.0,
+      );
+      final twiceWhite = ExposureMath.sceneEv(
+        cameraEv100: 10.0,
+        linearLuminance: 2.0,
+      );
+      expect(twiceWhite - white, closeTo(1.0, 1e-9));
+
+      final fourTimes = ExposureMath.sceneEv(
+        cameraEv100: 10.0,
+        linearLuminance: 4.0,
+      );
+      expect(fourTimes - white, closeTo(2.0, 1e-9));
+    });
+
+    test('a non-finite luminance yields NaN rather than a wrong number', () {
+      expect(
+        ExposureMath.sceneEv(
+          cameraEv100: 10.0,
+          linearLuminance: double.nan,
+        ).isNaN,
+        isTrue,
+      );
+    });
   });
 
   group('sRGB linearization', () {

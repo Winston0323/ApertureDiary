@@ -80,6 +80,29 @@ class LensInfo {
 
 const _channel = MethodChannel('com.example.aperture_diary/lens');
 
+/// What colour control the platform camera allows.
+///
+/// Whether white balance can be handled properly is not a software choice: it
+/// depends on whether this particular camera lets AWB be switched off and
+/// whether it reports its own gains back. Both come from static
+/// characteristics, so this needs no capture session.
+Future<Map<String, Object?>?> readColorCapabilities({
+  String? cameraName,
+}) async {
+  if (kIsWeb) return null;
+  try {
+    return await _channel.invokeMapMethod<String, Object?>(
+      'getColorCapabilities',
+      <String, Object?>{'cameraName': cameraName},
+    );
+  } on PlatformException {
+    return null;
+  } on MissingPluginException {
+    // iOS / desktop: no Camera2 to ask.
+    return null;
+  }
+}
+
 /// Reads lens info from the Android Camera2 characteristics.
 Future<LensInfo?> readLensInfoFromPlatform({String? cameraName}) async {
   if (kIsWeb) return null;

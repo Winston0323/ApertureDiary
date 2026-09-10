@@ -1,6 +1,6 @@
 import 'dart:async';
 import 'dart:io';
-import 'dart:math' show max;
+import 'dart:math' show max, min;
 
 import 'package:camera/camera.dart';
 import 'package:exif/exif.dart';
@@ -8,9 +8,12 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import 'ae_sweep.dart';
 import 'album_page.dart';
 import 'album_shot.dart';
 import 'calibration.dart';
+import 'capture_metadata.dart';
+import 'color_temperature.dart';
 import 'distance_estimator.dart';
 import 'exposure.dart';
 import 'film_format.dart';
@@ -21,7 +24,12 @@ import 'focal_arc_dial.dart';
 import 'gear.dart';
 import 'home_page.dart';
 import 'lens_info.dart';
+import 'live_meter.dart';
+import 'meter_debug.dart';
 import 'metering.dart';
+import 'number_input_dialog.dart';
+import 'raw_white_point.dart';
+import 'tone_curve.dart';
 import 'units.dart';
 import 'wheel_dial.dart';
 
@@ -140,20 +148,58 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
   /// Radius of the metered patch, in preview logical pixels.
   static const double _spotRadius = 18.0;
 
-  /// How long to let auto-exposure settle before trusting its choice.
+  /// Ceiling on the first exposure settle, used only by the still-capture
+  /// fallback. Live readings need no settle: they update every frame.
   static const Duration _aeSettleDelay = Duration(milliseconds: 900);
+
   static const Duration _autoMeterCooldown = Duration(seconds: 2);
+
+  /// How stale capture metadata may be before a still capture is used instead.
+  ///
+  /// Updates arrive at about 10 Hz, so anything older than this means the
+  /// stream has stopped rather than merely been thinned.
+  static const Duration _metadataFreshness = Duration(milliseconds: 600);
 
   ExposureParams? _params;
   SpotSample? _sample;
+
+  /// Derives a reading from every frame, and learns the device's response
+  /// slope from ordinary use.
+  final LiveMeter _liveMeter = LiveMeter();
+
+  /// The most recent live reading, kept for the status line and diagnostics.
+  LiveReading? _reading;
 
   /// Scene brightness as EV₁₀₀ (ISO-normalized). Display uses Hasselblad
   /// lens EV via [_lensEv].
   double? _ev;
   double _calibration = 0.0;
 
+  /// Measured encoded-luminance → true-linear mapping for this device.
+  ///
+  /// When present it replaces the sRGB inversion, which a real phone pipeline
+  /// departs from by whole stops away from mid grey.
+  ToneCurve? _toneCurve;
+
   /// Smoothed correlated colour temperature (Kelvin) of the metered patch.
   double? _cctKelvin;
+
+  /// Full colour reading behind [_cctKelvin], including how far off the
+  /// black-body locus it sits.
+  ColorTemperature? _cct;
+
+  /// Correction for the camera's white balance, once measured against a light
+  /// of known temperature.
+  WhiteBalanceReference? _wbReference;
+
+  /// Per-frame exposure and colour metadata from the camera's own capture
+  /// result. Empty on platforms that cannot supply it, in which case metering
+  /// falls back to reading a still capture's EXIF.
+  final CaptureMetadataStream _captureMetadata = CaptureMetadataStream();
+
+  /// The sensor's DNG calibration, needed to turn a raw white point into a
+  /// temperature. Null where the sensor publishes none.
+  SensorColorCalibration? _colorCalibration;
 
   /// Hasselblad / Compur orange-scale EV at the current metering EI.
   double? get _lensEv {
@@ -180,6 +226,27 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
   bool _isProcessing = false;
   final Stopwatch _publishClock = Stopwatch()..start();
   Size? _previewSize;
+
+  // ------------------------------------------------------------- diagnostics
+  /// Live readout of every metering intermediate. Off by default; turned on
+  /// from the calibration sheet to attribute an EV error to its source.
+  bool _debugOverlayOpen = false;
+
+  /// Scene EV₁₀₀ before calibration and smoothing, kept for the debug readout.
+  double? _rawSceneEv;
+
+  /// Geometry / pixel format of the last analysed preview frame.
+  int? _frameWidth;
+  int? _frameHeight;
+  String? _frameFormat;
+
+  /// True when the patch sits outside the range the pipeline is described
+  /// over, so the shown EV is stale rather than current.
+  bool _readingOutOfRange = false;
+
+  /// Last reference EV typed in, so repeat samples at one light level do not
+  /// have to be re-entered.
+  double? _lastReferenceEv;
 
   /// True while a dialog or sheet is up. Frame processing, repaints, and
   /// automatic re-metering all pause: a measurement restarts the capture
@@ -335,8 +402,103 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _loadCalibration();
+    _loadToneCurve();
+    _loadWhiteBalance();
     _loadGear();
+    _captureMetadata.start();
     _startCamera();
+  }
+
+  Future<void> _loadWhiteBalance() async {
+    final reference = await WhiteBalanceStore.load();
+    if (mounted && reference != null) {
+      setState(() => _wbReference = reference);
+    }
+  }
+
+  Future<void> _loadToneCurve() async {
+    final curve = await ToneCurveStore.load();
+    if (mounted && curve != null) {
+      setState(() => _toneCurve = curve);
+    }
+  }
+
+  /// Reads the scene from the current frame.
+  ///
+  /// Auto-exposure is aimed at the metered spot, so it drives that spot towards
+  /// mid grey by itself and the capture metadata reports what it settled on.
+  /// The reading is therefore the exposure plus a small trim for wherever the
+  /// patch actually landed — and the slope for that trim is measured from this
+  /// device's own response, so no tone curve is assumed.
+  ///
+  /// Without capture metadata there is nothing to read per frame, so this uses
+  /// the exposure from the last still capture instead.
+  LiveReading? _readLive(SpotSample sample) {
+    final metadata = _captureMetadata.latest;
+    if (metadata != null &&
+        metadata.hasExposure &&
+        metadata.age < _metadataFreshness) {
+      return _liveMeter.read(metadata: metadata, sample: sample);
+    }
+
+    final params = _params;
+    if (params == null) return null;
+    return _liveMeter.readFromParams(params: params, sample: sample);
+  }
+
+  /// Colour temperature of the current scene.
+  ///
+  /// Prefers the sensor's raw white point. Auto white balance exists to divide
+  /// the illuminant's colour out — measured on this device as gains of 1.85 on
+  /// red and 1.74 on blue, close to a stop — so a white wall under tungsten
+  /// renders neutral and, judged from rendered pixels, reads as daylight. The
+  /// raw white point is stated before that correction, so it still describes
+  /// the light rather than the leftovers.
+  ///
+  /// Falls back to the rendered patch where the raw point or the sensor
+  /// calibration is unavailable, which is what [WhiteBalanceReference] exists
+  /// to make usable.
+  ColorTemperature? _resolveColorTemperature(SpotSample sample) {
+    final calibration = _colorCalibration;
+    final neutral = _captureMetadata.latest;
+    if (calibration != null &&
+        neutral != null &&
+        neutral.neutralColorPoint != null &&
+        neutral.age < _metadataFreshness) {
+      final resolved = RawWhitePointSolver.solve(
+        neutral: neutral.neutralColorPoint!,
+        calibration: calibration,
+      );
+      if (resolved != null) return resolved;
+    }
+
+    return sample.colorTemperature(
+      curve: _toneCurve,
+      reference: _wbReference,
+    );
+  }
+
+  /// Status line describing the live reading.
+  ///
+  /// Describes the state of the reading rather than the progress of a
+  /// measurement: there are no longer any steps to count, because the value
+  /// updates on every frame.
+  String get _liveStatus {
+    if (_exposureLocked) return 'AE-L';
+
+    final reading = _reading;
+    if (reading == null) return 'Metering…';
+
+    switch (reading.quality) {
+      case LiveReadingQuality.unusable:
+        return reading.encodedLuminance > LiveMeter.target
+            ? 'Spot too bright — re-aim'
+            : 'Spot too dark — re-aim';
+      case LiveReadingQuality.fair:
+        return 'Live · approximate';
+      case LiveReadingQuality.good:
+        return reading.aeConverged ? 'Live' : 'Live · settling';
+    }
   }
 
   Future<void> _loadCalibration() async {
@@ -448,6 +610,7 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
     _captureHintTimer?.cancel();
     unawaited(_distanceEstimator?.stop());
     _distanceEstimator = null;
+    unawaited(_captureMetadata.dispose());
     WidgetsBinding.instance.removeObserver(this);
     final ctrl = _controller;
     if (ctrl != null) {
@@ -478,6 +641,7 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
       }
       await _controller!.startImageStream(_onFrame);
       await _loadLensInfo();
+      unawaited(_probeCaptureMetadata());
       if (!mounted) return;
       setState(() {
         _isInitialized = true;
@@ -498,15 +662,163 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
     if (platform != null) {
       setState(() => _lensInfo = platform);
     }
+    unawaited(_dumpColorCapabilities());
+    unawaited(_loadColorCalibration());
+  }
+
+  /// Loads the sensor's DNG calibration, which is what makes the raw white
+  /// point interpretable as a temperature.
+  Future<void> _loadColorCalibration() async {
+    final calibration = await readSensorColorCalibration(
+      cameraName: widget.camera.name,
+    );
+    if (mounted && calibration != null) {
+      setState(() => _colorCalibration = calibration);
+    }
+  }
+
+  /// Records whether the forked plugin is actually delivering capture
+  /// metadata, and what it contains.
+  ///
+  /// Everything downstream is designed to work without it, so a silent absence
+  /// would be indistinguishable from success. This makes the answer explicit.
+  Future<void> _probeCaptureMetadata() async {
+    // Give the analyzer time to produce frames and the stream to attach.
+    await Future<void>.delayed(const Duration(seconds: 5));
+    if (!mounted) return;
+
+    final metadata = _captureMetadata.latest;
+    final status = await CaptureMetadataStream.probeStatus();
+    if (!mounted) return;
+
+    final lines = <String>[
+      '# ApertureDiary capture metadata probe',
+      '# recorded: ${DateTime.now().toIso8601String()}',
+      '# available: ${metadata != null}',
+      // The authoritative answer to "is the forked plugin running?". A null
+      // status means the probe channel does not exist, so it is not.
+      '# fork_active: ${status != null}',
+      'field,value',
+    ];
+
+    if (status == null) {
+      lines.add(
+        'note,"Probe channel absent — the running plugin is not the fork. '
+        'Check that dependency_overrides points at packages/ and that the '
+        'build was not served from cache."',
+      );
+    } else {
+      for (final entry in status.entries) {
+        lines.add('probe_${entry.key},"${entry.value}"');
+      }
+    }
+
+    if (metadata == null) {
+      lines.add(
+        'note,"No metadata events received."',
+      );
+    } else {
+      void put(String key, Object? value) {
+        if (value == null) return;
+        final text = value is List ? value.join(' ') : '$value';
+        lines.add('$key,"$text"');
+      }
+
+      put('exposureTimeSeconds', metadata.exposureTimeSeconds);
+      put('iso', metadata.iso);
+      put('postRawSensitivityBoost', metadata.postRawSensitivityBoost);
+      put('effectiveIso', metadata.effectiveIso);
+      put('aperture', metadata.aperture);
+      put('focalLengthMm', metadata.focalLengthMm);
+      put('ev100', metadata.ev100);
+      put('aeState', metadata.aeState);
+      put('aeConverged', metadata.aeConverged);
+      put('aeExposureCompensation', metadata.aeExposureCompensation);
+      put('neutralColorPoint', metadata.neutralColorPoint);
+      put('awbState', metadata.awbState);
+      put('awbConverged', metadata.awbConverged);
+      put('awbMode', metadata.awbMode);
+      put('colorCorrectionGains', metadata.colorCorrectionGains);
+      put('hasExposure', metadata.hasExposure);
+
+      // The comparison that justifies the fork: the still-capture EXIF the app
+      // used to rely on, against the preview frame's own numbers.
+      final exif = _params;
+      if (exif != null) {
+        put('exif_ev100', exif.ev100);
+        final live = metadata.ev100;
+        if (live != null) {
+          put('ev100_difference_stops', live - exif.ev100);
+        }
+      }
+    }
+
+    await DiagnosticsExport.write(
+      'capture_metadata_${DiagnosticsExport.timestampSlug()}.csv',
+      '${lines.join('\n')}\n',
+    );
+  }
+
+  /// Records what colour control this camera allows, once per launch.
+  ///
+  /// Whether white balance can be measured rather than referenced is a property
+  /// of the hardware, not of the app, so the answer belongs in a file next to
+  /// the other diagnostics rather than in a log line that scrolls away.
+  Future<void> _dumpColorCapabilities() async {
+    final caps = await readColorCapabilities(cameraName: widget.camera.name);
+    if (caps == null) return;
+
+    final lines = <String>[
+      '# ApertureDiary camera colour capabilities',
+      '# recorded: ${DateTime.now().toIso8601String()}',
+      '# camera: ${widget.camera.name}',
+      'key,value',
+    ];
+    final keys = caps.keys.toList()..sort();
+    for (final key in keys) {
+      final value = caps[key];
+      final text = value is List ? value.join(' ') : '$value';
+      lines.add('$key,"$text"');
+    }
+
+    await DiagnosticsExport.write(
+      'color_caps_${DiagnosticsExport.timestampSlug()}.csv',
+      '${lines.join('\n')}\n',
+    );
   }
 
   // ---------------------------------------------------------------- metering
 
-  /// Locks auto-exposure onto the metered spot, then reads back the exposure
-  /// the camera chose. Those settings are what make an absolute EV possible:
-  /// pixel brightness alone only says how the scene compares to whatever the
-  /// camera exposed for.
-  Future<void> _measure({bool auto = false}) async {
+  /// Points auto-exposure at the metered spot.
+  ///
+  /// There is no measurement cycle any more. Aiming auto-exposure at the spot
+  /// makes the camera drive that spot towards mid grey on its own, and the
+  /// capture metadata reports the exposure it settles on, so [_onFrame] has a
+  /// reading available on every frame.
+  ///
+  /// An earlier version stepped exposure compensation itself and waited for
+  /// each step, taking seconds to arrive where auto-exposure had already got to
+  /// unaided. All that is needed here is to tell it where to look.
+  Future<void> _aimExposure() async {
+    final ctrl = _controller;
+    if (ctrl == null || !ctrl.value.isInitialized) return;
+    if (_exposureLocked) return;
+
+    try {
+      await ctrl.setExposureMode(ExposureMode.auto);
+      await ctrl.setExposurePoint(_meterPoint);
+    } on CameraException {
+      // Device may not support a metering point; AE average will do, and the
+      // reading still describes whatever it settled on.
+    }
+  }
+
+  /// Fallback measurement for devices without capture metadata.
+  ///
+  /// Without per-frame exposure there is nothing to read continuously, so a
+  /// still capture is still required. Kept for iOS and for Android builds
+  /// running the unforked plugin.
+  Future<void> _measureFromStill({bool auto = false}) async {
     final ctrl = _controller;
     if (ctrl == null || !ctrl.value.isInitialized || _measuring) return;
     if (_modalOpen) return;
@@ -517,22 +829,8 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
     });
 
     try {
-      try {
-        await ctrl.setExposureMode(ExposureMode.auto);
-        await ctrl.setExposurePoint(_meterPoint);
-      } on CameraException {
-        // Device may not support a metering point; AE average will do.
-      }
-
+      await _aimExposure();
       await Future<void>.delayed(_aeSettleDelay);
-
-      // Lock before capturing so the still and the preview stream share one
-      // exposure, and the reading stays valid while panning around.
-      try {
-        await ctrl.setExposureMode(ExposureMode.locked);
-      } on CameraException {
-        // Not fatal: the reading is still correct for this instant.
-      }
 
       final params = await _readExposure(ctrl);
       _lastMeasuredAt = DateTime.now();
@@ -549,8 +847,7 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
         } else {
           _failedMeasurements = 0;
           _params = params;
-          _ev = null; // Recomputed from the next frame.
-          _status = _exposureLocked ? 'AE-L' : 'Exposure locked';
+          _status = _exposureLocked ? 'AE-L' : 'Metered';
         }
       });
     } catch (e) {
@@ -567,7 +864,45 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
     }
   }
 
+  /// Re-aims the meter, reading live where the platform allows it.
+  Future<void> _measure({bool auto = false}) async {
+    if (_captureMetadata.isAvailable) {
+      _lastMeasuredAt = DateTime.now();
+      await _aimExposure();
+      return;
+    }
+    await _measureFromStill(auto: auto);
+  }
+
+  /// Reads the exposure the camera is holding.
+  ///
+  /// Prefers the preview frame's own capture metadata, which avoids taking a
+  /// photograph — the still pipeline is slow, interrupts the analysis stream,
+  /// and on a device measured here agreed with the preview to 0.0001 EV anyway,
+  /// so the photograph bought nothing.
+  ///
+  /// Falls back to a still capture's EXIF where that metadata is unavailable:
+  /// iOS, and any Android build without the forked plugin.
   Future<ExposureParams?> _readExposure(CameraController ctrl) async {
+    final live = _captureMetadata.latest;
+    if (live != null && live.hasExposure && live.age < _metadataFreshness) {
+      final focal = live.focalLengthMm;
+      if (focal != null && focal > 0) {
+        final merged = mergeLensInfo(
+          _lensInfo,
+          LensInfo(focalLengthMm: focal),
+        );
+        if (merged != null && mounted) {
+          setState(() => _lensInfo = merged);
+        }
+      }
+      return ExposureParams(
+        aperture: live.aperture!,
+        shutterSeconds: live.exposureTimeSeconds!,
+        iso: live.effectiveIso!,
+      );
+    }
+
     final bytes = await _captureStillBytes(ctrl);
     final tags = await readExifFromBytes(bytes);
     final exifLens = parseLensInfoFromExif(tags);
@@ -876,24 +1211,39 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
       if (sample == null) return;
 
       _sample = sample;
+      _frameWidth = image.width;
+      _frameHeight = image.height;
+      _frameFormat = image.format.group.name;
 
-      final params = _params;
-      if (params != null && (!_exposureLocked || _ev == null)) {
-        final raw = ExposureMath.sceneEv(
-              cameraEv100: params.ev100,
-              linearLuminance: sample.linearLuminance,
-            ) +
-            _calibration;
-        // Light smoothing keeps the digits readable without adding lag.
-        final previous = _ev;
-        _ev = previous == null ? raw : previous + (raw - previous) * 0.35;
+      // Read the scene live. With capture metadata every frame carries the
+      // exposure the camera used for it, so there is nothing to wait for.
+      if (!_exposureLocked || _ev == null) {
+        final reading = _readLive(sample);
+        if (reading != null &&
+            reading.quality != LiveReadingQuality.unusable) {
+          _reading = reading;
+          _rawSceneEv = reading.sceneEv100;
+          _readingOutOfRange = false;
+          _ev = LiveMeter.smooth(
+            _ev,
+            reading.sceneEv100 + _calibration,
+            reading,
+          );
+        } else if (reading != null) {
+          // Crushed or clipped: hold the last good number rather than show one
+          // that is wrong by stops.
+          _reading = reading;
+          _readingOutOfRange = true;
+        }
       }
 
-      final cct = sample.cctKelvin;
+      final cct = _resolveColorTemperature(sample);
       if (cct != null && (!_exposureLocked || _cctKelvin == null)) {
+        _cct = cct;
         final previous = _cctKelvin;
-        _cctKelvin =
-            previous == null ? cct : previous + (cct - previous) * 0.35;
+        _cctKelvin = previous == null
+            ? cct.kelvin
+            : previous + (cct.kelvin - previous) * 0.35;
       }
 
       if (!_measuringDistance && !_exposureLocked) {
@@ -972,9 +1322,11 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
   Future<void> _cancelDistanceMeasure() =>
       _finishDistanceMeasure(keepResult: false);
 
-  /// Re-meters when the locked exposure no longer suits the spot: once the
-  /// patch clips or crushes, the tone curve stops being invertible and the
-  /// reading would drift.
+  /// Re-meters when the patch has drifted too far from where the loop left it.
+  ///
+  /// The reading is only as good as the residual is small, so once panning has
+  /// carried the patch well off mid grey, re-closing the loop beats stretching
+  /// the local slope further than it holds.
   void _maybeAutoMeter(SpotSample sample) {
     if (_exposureLocked || _measuring || _modalOpen || _failedMeasurements >= 3) {
       return;
@@ -983,7 +1335,7 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
     if (last != null && DateTime.now().difference(last) < _autoMeterCooldown) {
       return;
     }
-    if (_params == null || !sample.isUsable) {
+    if (_params == null || _readingOutOfRange || !sample.isUsable) {
       _measure(auto: true);
     }
   }
@@ -1004,6 +1356,7 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
       );
       _ev = null;
       _cctKelvin = null;
+      _cct = null;
     });
     if (wasMeasuringDistance) {
       // Retarget: stop current session and lock the new point next frame.
@@ -1022,6 +1375,7 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
       _meterPoint = const Offset(0.5, 0.5);
       _ev = null;
       _cctKelvin = null;
+      _cct = null;
     });
     _measure();
   }
@@ -1182,7 +1536,10 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
     final k = _cctKelvin;
     if (k == null) return 'WB —';
     final rounded = (k / 50).round() * 50;
-    return '${rounded}K';
+    // A tilde marks a reading well off the black-body locus, where the number
+    // is indicative rather than measured.
+    final approx = _cct?.confidence == CctConfidence.low ? '~' : '';
+    return '$approx${rounded}K';
   }
 
   // ---------------------------------------------------------------------- UI
@@ -1455,6 +1812,27 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
                                 ],
                               ),
                             ),
+                            if (_debugOverlayOpen)
+                              Positioned(
+                                top: 10,
+                                right: 10,
+                                // Swallow taps: the overlay sits inside the
+                                // preview's tap target, and hitting it must
+                                // not move the metering spot.
+                                child: GestureDetector(
+                                  onTapUp: (_) {},
+                                  behavior: HitTestBehavior.opaque,
+                                  child: MeterDebugOverlay(
+                                    info: _debugInfo,
+                                    onLogSample: () =>
+                                        unawaited(_logMeterSample()),
+                                    onOpenLog: () => unawaited(_openMeterLog()),
+                                    onClose: () => setState(
+                                      () => _debugOverlayOpen = false,
+                                    ),
+                                  ),
+                                ),
+                              ),
                             Positioned(
                               bottom: 8,
                               left: 8,
@@ -1753,8 +2131,27 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
   }
 
   Widget _statusChip() {
-    final sample = _sample;
-    final warn = sample != null && !sample.isUsable;
+    final warn = _readingOutOfRange;
+    // Prefer the live status where a reading exists; _status is only used for
+    // the still-capture fallback and for errors.
+    final live = _captureMetadata.isAvailable || _reading != null;
+    final text = warn
+        ? _liveStatus
+        : live
+            ? _liveStatus
+            : _status;
+
+    final IconData icon;
+    if (warn) {
+      icon = Icons.warning_amber_rounded;
+    } else if (_exposureLocked) {
+      icon = Icons.lock_outline;
+    } else {
+      // Live readings are continuous, so a static lock icon would misdescribe
+      // them.
+      icon = Icons.sensors;
+    }
+
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
       decoration: BoxDecoration(
@@ -1764,14 +2161,17 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
       child: Row(
         children: [
           Icon(
-            warn ? Icons.warning_amber_rounded : Icons.lock_outline,
+            icon,
             size: 13,
             color: warn ? Colors.orangeAccent : Colors.white70,
           ),
           const SizedBox(width: 5),
           Text(
-            _status,
-            style: const TextStyle(color: Colors.white70, fontSize: 11),
+            text,
+            style: TextStyle(
+              color: warn ? Colors.orangeAccent : Colors.white70,
+              fontSize: 11,
+            ),
           ),
         ],
       ),
@@ -2641,6 +3041,341 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
     await CalibrationStore.save(_calibration);
   }
 
+  // ------------------------------------------------------------- diagnostics
+
+  /// Measures the camera's white-balance bias against a light the user names.
+  ///
+  /// Auto white balance has already divided the illuminant's colour out, and
+  /// the plugin exposes no way to read what it divided by. One reading of a
+  /// neutral surface under a known light pins that unknown down for good.
+  Future<void> _setWhiteBalanceReference() async {
+    final sample = _sample;
+    if (sample == null) {
+      setState(
+        () => _setCaptureHint(
+          'Nothing metered yet',
+          error: true,
+          clearAfter: const Duration(seconds: 2),
+        ),
+      );
+      return;
+    }
+
+    final kelvin = await _whileModalOpen(
+      () => showDialog<double>(
+        context: context,
+        builder: (_) => NumberInputDialog(
+          title: 'Reference light (K)',
+          helper: 'Aim at a white or grey surface lit only by a light whose '
+              'temperature you know: 2850 tungsten, 3200 studio, 5500 '
+              'daylight, 6500 overcast.',
+          initialText:
+              _wbReference?.referenceKelvin.round().toString() ?? '5500',
+        ),
+      ),
+    );
+
+    if (kelvin == null || !mounted) return;
+
+    final reference = WhiteBalanceReference.fromNeutralPatch(
+      r: sample.r,
+      g: sample.g,
+      b: sample.b,
+      kelvin: kelvin,
+      curve: _toneCurve,
+    );
+
+    if (reference == null) {
+      setState(
+        () => _setCaptureHint(
+          'Patch is not neutral enough to reference',
+          error: true,
+          clearAfter: const Duration(seconds: 3),
+        ),
+      );
+      return;
+    }
+
+    await WhiteBalanceStore.save(reference);
+    if (!mounted) return;
+    setState(() {
+      _wbReference = reference;
+      // Recompute from the next frame under the new reference.
+      _cctKelvin = null;
+      _cct = null;
+      _setCaptureHint(
+        'WB referenced to ${kelvin.round()}K',
+        clearAfter: const Duration(seconds: 2),
+      );
+    });
+  }
+
+  Future<void> _clearWhiteBalanceReference() async {
+    await WhiteBalanceStore.clear();
+    if (!mounted) return;
+    setState(() {
+      _wbReference = null;
+      _cctKelvin = null;
+      _cct = null;
+    });
+  }
+
+  /// Snapshot of every intermediate the current reading was derived from.
+  MeterDebugInfo get _debugInfo => MeterDebugInfo(
+        params: _params,
+        sample: _sample,
+        rawSceneEv: _rawSceneEv,
+        calibration: _calibration,
+        smoothedEv100: _ev,
+        lensEv: _lensEv,
+        meterIso: _meterIso,
+        cctKelvin: _cctKelvin,
+        frameWidth: _frameWidth,
+        frameHeight: _frameHeight,
+        frameFormat: _frameFormat,
+        exposureLocked: _exposureLocked,
+        measuredAt: _lastMeasuredAt,
+        aeSettleMs: _aeSettleDelay.inMilliseconds,
+        toneCurveRange: _toneCurve == null
+            ? null
+            : '${_toneCurve!.minEncoded.toStringAsFixed(2)}–'
+                '${_toneCurve!.maxEncoded.toStringAsFixed(2)}',
+        readingOutOfRange: _readingOutOfRange,
+        servoResidual: _reading == null
+            ? null
+            : _reading!.encodedLuminance - LiveMeter.target,
+        servoSlope: _reading?.slope,
+        servoCorrection: _reading?.correctionStops,
+        servoErrorBound: _reading?.estimatedErrorStops,
+        servoIterations: null,
+        servoOutcome: _reading?.quality.name,
+        duv: _cct?.duv,
+        cctConfidence: _cct?.confidence.name,
+        wbReferenceKelvin: _wbReference?.referenceKelvin,
+        cctSource: _colorCalibration != null &&
+                _captureMetadata.latest?.neutralColorPoint != null
+            ? 'raw white point'
+            : 'rendered pixels',
+        exposureSource: _captureMetadata.latest?.hasExposure == true
+            ? 'preview frame'
+            : 'still EXIF',
+      );
+
+  /// Asks for the trusted meter's lens-scale EV, then appends one CSV row.
+  ///
+  /// The reference is entered per sample rather than assumed, because the
+  /// whole point of the log is to compare against something external.
+  Future<void> _logMeterSample() async {
+    if (_ev == null || _params == null) {
+      setState(
+        () => _setCaptureHint(
+          'Nothing measured yet',
+          error: true,
+          clearAfter: const Duration(seconds: 2),
+        ),
+      );
+      return;
+    }
+
+    final snapshot = _debugInfo;
+    final entered = await _whileModalOpen(
+      () => showDialog<double>(
+        context: context,
+        builder: (_) => NumberInputDialog(
+          title: 'Reference EV',
+          helper: 'Lens-scale EV from the meter you trust '
+              '(at ISO ${snapshot.meterIso}). Leave blank to log unpaired.',
+          initialText: _lastReferenceEv?.toStringAsFixed(1) ?? '',
+        ),
+      ),
+    );
+
+    if (entered != null && entered.isFinite) {
+      _lastReferenceEv = entered;
+    }
+
+    await MeterLogStore.append(
+      snapshot.toCsvRow(referenceEv: entered),
+    );
+
+    if (!mounted) return;
+    final count = await MeterLogStore.count();
+    if (!mounted) return;
+    setState(
+      () => _setCaptureHint(
+        'Logged · $count samples',
+        clearAfter: const Duration(seconds: 2),
+      ),
+    );
+  }
+
+  Future<void> _openMeterLog() async {    await _whileModalOpen(
+      () => showModalBottomSheet<void>(
+        context: context,
+        isScrollControlled: true,
+        backgroundColor: const Color(0xFF161616),
+        shape: const RoundedRectangleBorder(
+          borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+        ),
+        builder: (_) => const MeterLogSheet(),
+      ),
+    );
+  }
+
+  Future<void> _openAeSweep() async {
+    await _whileModalOpen(
+      () => showModalBottomSheet<void>(
+        context: context,
+        isScrollControlled: true,
+        backgroundColor: const Color(0xFF161616),
+        shape: const RoundedRectangleBorder(
+          borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+        ),
+        builder: (_) => AeSweepSheet(
+          run: _runAeSweep,
+          accent: _accent,
+          onCurveApplied: (curve) {
+            if (!mounted) return;
+            setState(() {
+              _toneCurve = curve;
+              // Recompute from the next frame under the new curve.
+              _ev = null;
+            });
+          },
+        ),
+      ),
+    );
+  }
+
+  /// Steps AE across its compensation range on a static scene, recording what
+  /// the camera exposed at and how the preview rendered the patch each time.
+  ///
+  /// The scene does not change, so every rung describes the same light and
+  /// should report the same EV. Any spread is error, and needs no external
+  /// reference to measure — which is the point: it works without a grey card
+  /// or a second meter.
+  Future<AeSweepResult?> _runAeSweep(
+    void Function(AeSweepProgress) onProgress,
+  ) async {
+    final ctrl = _controller;
+    if (ctrl == null || !ctrl.value.isInitialized) return null;
+
+    final double minOffset;
+    final double maxOffset;
+    try {
+      minOffset = await ctrl.getMinExposureOffset();
+      maxOffset = await ctrl.getMaxExposureOffset();
+    } on CameraException {
+      return null;
+    }
+
+    // A device with no compensation range cannot be swept.
+    if (!(maxOffset - minOffset).isFinite || maxOffset - minOffset < 0.5) {
+      return null;
+    }
+
+    // Sample the range at one-stop-ish intervals, capped so a full sweep stays
+    // under about a minute.
+    const maxRungs = 7;
+    final span = maxOffset - minOffset;
+    final rungs = min(maxRungs, max(3, span.round() + 1));
+    final targets = List<double>.generate(
+      rungs,
+      (i) => minOffset + span * i / (rungs - 1),
+    );
+
+    final previousMeasuring = _measuring;
+    _measuring = true; // Hold off automatic re-metering for the duration.
+    final points = <AeSweepPoint>[];
+
+    try {
+      for (var i = 0; i < targets.length; i++) {
+        if (!mounted) break;
+        final target = targets[i];
+
+        onProgress(
+          AeSweepProgress(
+            done: i,
+            total: targets.length,
+            message: 'Rung ${i + 1} of ${targets.length} · '
+                '${target >= 0 ? '+' : '−'}${target.abs().toStringAsFixed(1)} EV',
+          ),
+        );
+
+        try {
+          await ctrl.setExposureMode(ExposureMode.auto);
+          await ctrl.setExposurePoint(_meterPoint);
+          await ctrl.setExposureOffset(target);
+        } on CameraException {
+          continue;
+        }
+
+        await Future<void>.delayed(_aeSettleDelay);
+
+        try {
+          await ctrl.setExposureMode(ExposureMode.locked);
+        } on CameraException {
+          // Not fatal — the still and the patch are still read back to back.
+        }
+
+        final params = await _readExposure(ctrl);
+        if (params == null) continue;
+
+        // Sample after the still, so the patch reflects the same locked
+        // exposure the EXIF describes.
+        final sample = await _sampleCurrentPatch();
+        if (sample == null) continue;
+
+        points.add(
+          AeSweepPoint(
+            requestedOffset: target,
+            params: params,
+            sample: sample,
+          ),
+        );
+      }
+    } finally {
+      _measuring = previousMeasuring;
+      try {
+        await ctrl.setExposureOffset(0);
+        await ctrl.setExposureMode(ExposureMode.auto);
+      } on CameraException {
+        // Best effort restore.
+      }
+      // The sweep invalidated the working reading; take a fresh one.
+      if (mounted) {
+        setState(() {
+          _params = null;
+          _ev = null;
+        });
+        unawaited(_measure(auto: true));
+      }
+    }
+
+    onProgress(
+      AeSweepProgress(
+        done: targets.length,
+        total: targets.length,
+        message: 'Done',
+      ),
+    );
+
+    return AeSweepResult(points: points);
+  }
+
+  /// Waits for the next analysed preview frame and returns its patch.
+  Future<SpotSample?> _sampleCurrentPatch() async {
+    // _onFrame refreshes _sample continuously; give it a couple of frames to
+    // publish one taken under the exposure just locked in.
+    final before = _sample;
+    for (var i = 0; i < 20; i++) {
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      final current = _sample;
+      if (current != null && !identical(current, before)) return current;
+    }
+    return _sample;
+  }
+
   Future<void> _calibrationSheet(double value) {
     return showModalBottomSheet<void>(
       context: context,
@@ -2705,6 +3440,118 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
                           });
                         },
                         child: const Text('Reset'),
+                      ),
+                    ),
+                    const Divider(height: 20, color: Colors.white12),
+                    const Text(
+                      'White balance reference',
+                      style: TextStyle(
+                        fontSize: 14,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      _wbReference == null
+                          ? 'Auto white balance has already removed most of '
+                              'the light\'s colour, and Android gives no way '
+                              'to read what it removed. Meter a white or grey '
+                              'surface under a light you know, name its '
+                              'temperature, and every later reading is '
+                              'anchored to it.'
+                          : 'Anchored to '
+                              '${_wbReference!.referenceKelvin.round()}K, '
+                              'correcting '
+                              '${_wbReference!.strengthStops.toStringAsFixed(2)}'
+                              ' stops of channel gain.',
+                      style: const TextStyle(
+                        fontSize: 11,
+                        color: Colors.white54,
+                      ),
+                    ),
+                    const SizedBox(height: 6),
+                    Row(
+                      children: [
+                        FilledButton.tonalIcon(
+                          onPressed: () {
+                            Navigator.of(ctx).pop();
+                            unawaited(_setWhiteBalanceReference());
+                          },
+                          icon: const Icon(Icons.wb_incandescent_outlined,
+                              size: 16),
+                          label: Text(
+                            _wbReference == null
+                                ? 'Set reference'
+                                : 'Re-measure',
+                          ),
+                        ),
+                        if (_wbReference != null) ...[
+                          const SizedBox(width: 8),
+                          TextButton(
+                            onPressed: () {
+                              setSheetState(() {});
+                              unawaited(_clearWhiteBalanceReference());
+                            },
+                            child: const Text('Clear'),
+                          ),
+                        ],
+                      ],
+                    ),
+                    const Divider(height: 20, color: Colors.white12),
+                    const Text(
+                      'Diagnostics',
+                      style: TextStyle(
+                        fontSize: 14,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    const Text(
+                      'A single offset only corrects a constant error. Run the '
+                      'AE sweep to find out whether this phone\'s error is '
+                      'constant — it needs no grey card and no reference '
+                      'meter, only a still scene.',
+                      style: TextStyle(fontSize: 11, color: Colors.white54),
+                    ),
+                    const SizedBox(height: 6),
+                    Align(
+                      alignment: Alignment.centerLeft,
+                      child: FilledButton.tonalIcon(
+                        onPressed: () {
+                          Navigator.of(ctx).pop();
+                          unawaited(_openAeSweep());
+                        },
+                        icon: const Icon(Icons.compare_arrows, size: 16),
+                        label: const Text('AE consistency sweep'),
+                      ),
+                    ),
+                    SwitchListTile(
+                      contentPadding: EdgeInsets.zero,
+                      dense: true,
+                      value: _debugOverlayOpen,
+                      activeThumbColor: _accent,
+                      title: const Text(
+                        'Live meter readout',
+                        style: TextStyle(fontSize: 13),
+                      ),
+                      subtitle: const Text(
+                        'Show EXIF, patch luminance and tone-curve warnings',
+                        style: TextStyle(fontSize: 11, color: Colors.white38),
+                      ),
+                      onChanged: (v) {
+                        setSheetState(() {});
+                        setState(() => _debugOverlayOpen = v);
+                      },
+                    ),
+                    Align(
+                      alignment: Alignment.centerLeft,
+                      child: TextButton.icon(
+                        onPressed: () {
+                          Navigator.of(ctx).pop();
+                          unawaited(_openMeterLog());
+                        },
+                        icon: const Icon(Icons.list_alt, size: 16),
+                        label: const Text('Metering log'),
                       ),
                     ),
                   ],

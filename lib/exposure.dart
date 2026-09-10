@@ -64,7 +64,16 @@ class ExposureMath {
   }
 
   /// Scene EV₁₀₀ at a sampled point, given the exposure the frame was shot at
-  /// and the point's linear luminance (0..1, where [middleGrey] is mid-tone).
+  /// and the point's linear luminance, where [middleGrey] is mid-tone.
+  ///
+  /// Luminance above 1.0 must not be capped: 1.0 is diffuse white at the
+  /// metered exposure, and a patch the camera deliberately overexposed sits
+  /// above it. Capping there silently understates every bright reading — it
+  /// cost 1.6 EV on a real 7-rung sweep before this was fixed.
+  ///
+  /// The low end is floored rather than rejected so a black patch yields a very
+  /// low EV instead of NaN, which would poison the caller's smoothing filter
+  /// permanently.
   ///
   /// Convert with [lensEvFromEv100] for the Hasselblad lens-scale readout at
   /// the working film ISO.
@@ -72,7 +81,8 @@ class ExposureMath {
     required double cameraEv100,
     required double linearLuminance,
   }) {
-    final l = linearLuminance.clamp(1e-6, 1.0);
+    if (!linearLuminance.isFinite) return double.nan;
+    final l = linearLuminance < 1e-6 ? 1e-6 : linearLuminance;
     return cameraEv100 + log2(l / middleGrey);
   }
 
@@ -107,6 +117,28 @@ class ExposureMath {
   static final Float64List srgbLut = Float64List.fromList(
     List<double>.generate(256, (i) => srgbToLinear(i / 255.0)),
   );
+
+  /// sRGB opto-electronic transfer function: linear 0..1 → encoded 0..1.
+  ///
+  /// Inverse of [srgbToLinear]; used to place an anchor on the encoded axis
+  /// when fitting a measured tone curve.
+  static double linearToSrgb(double linear) {
+    final l = linear.clamp(0.0, 1.0);
+    if (l <= 0.0031308) return l * 12.92;
+    return 1.055 * pow(l, 1 / 2.4).toDouble() - 0.055;
+  }
+
+  /// Encoded value a perfectly sRGB pipeline would give 18% middle grey.
+  static final double middleGreyEncoded = linearToSrgb(middleGrey);
+
+  /// Encoded-luminance window over which the plain sRGB inversion is close
+  /// enough to a real phone tone curve to meter from.
+  ///
+  /// Phone ISPs apply a contrasty S-curve: shadows are crushed and highlights
+  /// roll off, so far outside this band the sRGB inversion understates true
+  /// luminance by whole stops. Readings there are not worth reporting.
+  static const double usableEncodedMin = 0.30;
+  static const double usableEncodedMax = 0.75;
 
   /// Relative linear luminance (BT.709) from gamma-encoded 8-bit channels.
   static double linearLuminance8(int r, int g, int b) {

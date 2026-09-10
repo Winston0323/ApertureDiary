@@ -1,0 +1,16 @@
+# ApertureDiary AE consistency sweep
+# recorded: 2026-09-03T17:30:23.132467
+# rungs: 7 (7 usable)
+# reference_ev100: 5.195
+# spread_ev: 2.309
+# residual_slope_per_encoded_unit: 0.588
+# consistent: false
+# verdict: Spread of 2.31 EV, drifting up with patch brightness (0.59 EV per unit of encoded luminance). The sRGB inversion does not match the real tone curve. A single offset cannot fix this — a per-luminance correction is needed.
+requested_offset,exif_n,exif_t,exif_iso,exif_ev100,lin_y,enc_y,stops_from_mid,scene_ev,residual,usable
+-4.000,1.880,0.005479,72.0,9.807,0.00371,0.04738,-5.601,4.206,-0.990,1
+-2.667,1.880,0.008333,120.0,8.465,0.01478,0.12716,-3.606,4.859,-0.336,1
+-1.333,1.880,0.008333,319.0,7.055,0.08324,0.31929,-1.113,5.942,0.747,1
+0.000,1.880,0.019999,327.0,5.756,0.28227,0.56773,0.649,6.405,1.210,1
+1.333,1.880,0.029999,393.0,4.906,0.45396,0.70411,1.335,6.240,1.045,1
+2.667,1.880,0.033333,967.0,3.455,0.60151,0.79853,1.741,5.195,0.000,1
+4.000,1.880,0.033333,2320.0,2.192,0.67364,0.83983,1.904,4.096,-1.099,1
