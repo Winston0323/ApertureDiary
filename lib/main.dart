@@ -20,6 +20,7 @@ import 'film_format.dart';
 import 'film_frame.dart';
 import 'film_stock.dart';
 import 'flash_page.dart';
+import 'frame_counter.dart';
 import 'focal_arc_dial.dart';
 import 'gear.dart';
 import 'home_page.dart';
@@ -27,8 +28,13 @@ import 'lens_info.dart';
 import 'live_meter.dart';
 import 'meter_debug.dart';
 import 'metering.dart';
+import 'multi_spot.dart';
+import 'nd_filter.dart';
 import 'number_input_dialog.dart';
 import 'raw_white_point.dart';
+import 'reference_exposure.dart';
+import 'shoot_checklist_page.dart';
+import 'reference_exposure_dialog.dart';
 import 'tone_curve.dart';
 import 'units.dart';
 import 'wheel_dial.dart';
@@ -156,9 +162,9 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
 
   /// How stale capture metadata may be before a still capture is used instead.
   ///
-  /// Updates arrive at about 10 Hz, so anything older than this means the
-  /// stream has stopped rather than merely been thinned.
-  static const Duration _metadataFreshness = Duration(milliseconds: 600);
+  /// Updates arrive at about 10 Hz. Pairing a frame with exposure from more
+  /// than ~2 metadata ticks ago describes a different picture, so this is tight.
+  static const Duration _metadataFreshness = Duration(milliseconds: 250);
 
   ExposureParams? _params;
   SpotSample? _sample;
@@ -235,6 +241,29 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
   /// Scene EV₁₀₀ before calibration and smoothing, kept for the debug readout.
   double? _rawSceneEv;
 
+  /// Active "match to a reference meter" run, fed by [_onFrame].
+  EvCalibrationRun? _calibrationRun;
+
+  /// What the reference camera showed last time, to prefill a repeat match.
+  ReferenceExposure? _lastReference;
+
+  /// Neutral density filter on the lens. The meter reads the scene without it,
+  /// so only the solved shutter / aperture change, never the EV reading.
+  NdFilter _nd = NdFilter.none;
+
+  /// Multi-spot view: lowest, 25 %, centre, 75 % and highest EV in the frame,
+  /// drawn on the video feed.
+  /// Frame of the loaded roll. The checklist advances it.
+  int _frameCount = FrameCount.min;
+
+  bool _multiSpotEnabled = false;
+  MultiSpotResult? _multiSpot;
+
+  /// Whole-frame analysis is far heavier than one spot, so it runs a few times
+  /// a second rather than on every frame.
+  final Stopwatch _multiSpotClock = Stopwatch()..start();
+  static const int _multiSpotIntervalMs = 200;
+
   /// Geometry / pixel format of the last analysed preview frame.
   int? _frameWidth;
   int? _frameHeight;
@@ -291,16 +320,7 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
     if (_film.isTungsten && _daylight85 && _meterIso != _iso) {
       return 'EI $_meterIso';
     }
-    return 'ISO $_iso';
-  }
-
-  String get _isoSubtitle {
-    if (_film.isTungsten && _daylight85) {
-      if (_meterIso == _iso) return 'ISO $_iso T';
-      return 'EI $_meterIso +85';
-    }
-    if (_film.isTungsten) return 'ISO $_iso T';
-    return 'ISO $_iso';
+    return _film.isTungsten ? 'ISO $_iso T' : 'ISO $_iso';
   }
 
   UserCamera? _body;
@@ -405,8 +425,15 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
     _loadToneCurve();
     _loadWhiteBalance();
     _loadGear();
+    _loadFrameCount();
     _captureMetadata.start();
     _startCamera();
+  }
+
+  Future<void> _loadFrameCount() async {
+    final count = await FrameCounterStore.load(widget.film.id);
+    if (!mounted) return;
+    setState(() => _frameCount = count);
   }
 
   Future<void> _loadWhiteBalance() async {
@@ -438,12 +465,155 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
     if (metadata != null &&
         metadata.hasExposure &&
         metadata.age < _metadataFreshness) {
-      return _liveMeter.read(metadata: metadata, sample: sample);
+      return _liveMeter.read(
+        metadata: metadata,
+        sample: sample,
+        curve: _toneCurve,
+      );
     }
 
     final params = _params;
     if (params == null) return null;
-    return _liveMeter.readFromParams(params: params, sample: sample);
+    return _liveMeter.readFromParams(
+      params: params,
+      sample: sample,
+      curve: _toneCurve,
+    );
+  }
+
+  /// EV₁₀₀ the camera's current exposure corresponds to, from the frame's own
+  /// metadata where it is fresh, else the last still capture.
+  double? _cameraEv100Now() {
+    final metadata = _captureMetadata.latest;
+    if (metadata != null &&
+        metadata.hasExposure &&
+        metadata.age < _metadataFreshness) {
+      return metadata.ev100;
+    }
+    return _params?.ev100;
+  }
+
+  /// Samples the whole frame and picks the five spots.
+  void _updateMultiSpot(CameraImage image, Size previewSize, double crop) {
+    if (_multiSpotClock.elapsedMilliseconds < _multiSpotIntervalMs) return;
+    _multiSpotClock.reset();
+
+    final cameraEv = _cameraEv100Now();
+    if (cameraEv == null || !cameraEv.isFinite) return;
+
+    // The focal simulation crops the preview about its centre; the same
+    // mapping the single spot uses.
+    Offset toPreview(Offset p) {
+      if (crop >= 1.0) return p;
+      final m = FilmOptics.mapViewfinderToPreview(p.dx, p.dy, crop);
+      return Offset(m.x, m.y);
+    }
+
+    final cells = sampleLumaGridFromImage(
+      image: image,
+      widgetSize: previewSize,
+      quarterTurns: _quarterTurns,
+      mirror: _mirror,
+      toPreview: toPreview,
+      radiusScale: crop.clamp(0.05, 1.0).toDouble(),
+    );
+    // The centre uses the same patch definition as the main spot, so the two
+    // agree whenever the spot is left in the middle.
+    final centre = sampleSpot(
+      image: image,
+      spot: toPreview(const Offset(0.5, 0.5)),
+      widgetSize: previewSize,
+      quarterTurns: _quarterTurns,
+      mirror: _mirror,
+      radiusInWidgetPixels: _spotRadius,
+    );
+    if (cells == null || centre == null) return;
+
+    final result = MultiSpotAnalyzer.analyze(
+      cells: cells,
+      center: LumaCell(x: 0.5, y: 0.5, encoded: centre.encodedLuminance),
+      evaluate: (encoded) => _liveMeter.readEncoded(
+        cameraEv100: cameraEv,
+        encoded: encoded,
+        curve: _toneCurve,
+      ),
+      previous: _multiSpot,
+    );
+    if (result != null) _multiSpot = result;
+  }
+
+  void _toggleMultiSpot() {
+    setState(() {
+      _multiSpotEnabled = !_multiSpotEnabled;
+      _multiSpot = null;
+      _setCaptureHint(
+        _multiSpotEnabled ? 'Multi-spot on' : 'Multi-spot off',
+        clearAfter: const Duration(seconds: 2),
+      );
+    });
+  }
+
+  /// A spot's value on the same scale as the EV tile: Hasselblad lens EV at
+  /// the working ISO, with the calibration offset applied.
+  String _multiSpotValue(MultiSpotPoint p) {
+    final lensEv = ExposureMath.lensEvFromEv100(
+      ev100: p.ev100 + _calibration,
+      iso: _meterIso,
+    );
+    return '${p.prefix}${lensEv.toStringAsFixed(1)}';
+  }
+
+  Widget _multiSpotLegend(MultiSpotResult result) {
+    // One slim row, shadows to highlights, left to right. The markers on the
+    // frame already carry their own values; this is just the key.
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+      decoration: BoxDecoration(
+        color: Colors.black54,
+        borderRadius: BorderRadius.circular(10),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          for (var i = 0; i < result.points.length; i++) ...[
+            if (i > 0) const SizedBox(width: 9),
+            Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  result.points[i].role.label,
+                  style: const TextStyle(color: Colors.white54, fontSize: 9),
+                ),
+                Text(
+                  _multiSpotValue(result.points[i]),
+                  style: TextStyle(
+                    color: _multiSpotColor(result.points[i].role),
+                    fontSize: 12,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ],
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  /// Colour-coded cold → hot: shadows blue, highlights red.
+  Color _multiSpotColor(MultiSpotRole role) {
+    switch (role) {
+      case MultiSpotRole.lowest:
+        return const Color(0xFF5C8DFF);
+      case MultiSpotRole.quarter:
+        return const Color(0xFF2DD4BF);
+      case MultiSpotRole.center:
+        return Colors.white;
+      case MultiSpotRole.threeQuarter:
+        return const Color(0xFFFF9F43);
+      case MultiSpotRole.highest:
+        return const Color(0xFFFF5252);
+    }
   }
 
   /// Colour temperature of the current scene.
@@ -595,17 +765,29 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    final ctrl = _controller;
-    if (ctrl == null || !ctrl.value.isInitialized) return;
-    if (state == AppLifecycleState.inactive) {
-      if (ctrl.value.isStreamingImages) ctrl.stopImageStream();
-    } else if (state == AppLifecycleState.resumed) {
-      if (!ctrl.value.isStreamingImages) ctrl.startImageStream(_onFrame);
+    switch (state) {
+      case AppLifecycleState.hidden:
+      case AppLifecycleState.paused:
+      case AppLifecycleState.detached:
+        // Out of sight: give the camera back rather than just pausing frames.
+        unawaited(_releaseCamera());
+      case AppLifecycleState.resumed:
+        unawaited(_resumeCamera());
+      case AppLifecycleState.inactive:
+        // Transient (permission prompt, notification shade, app switcher).
+        // Closing the camera here would flicker, so only the analysis stops.
+        final ctrl = _controller;
+        if (ctrl != null &&
+            ctrl.value.isInitialized &&
+            ctrl.value.isStreamingImages) {
+          unawaited(ctrl.stopImageStream());
+        }
     }
   }
 
   @override
   void dispose() {
+    _wantCamera = false;
     _focalDialHideTimer?.cancel();
     _captureHintTimer?.cancel();
     unawaited(_distanceEstimator?.stop());
@@ -620,8 +802,56 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
     super.dispose();
   }
 
-  Future<void> _startCamera() async {
-    _controller = CameraController(
+  // ------------------------------------------------------- camera lifecycle
+  //
+  // The camera is only held while it is actually in use: it is closed when the
+  // app leaves the foreground and while the album or flash page covers this
+  // one, and reopened on return. Opening and closing are serialised so a quick
+  // background/foreground cannot overlap a start with a teardown.
+
+  /// Whether the camera should currently be open. Set synchronously; the
+  /// queued operations act on it when their turn comes.
+  bool _wantCamera = true;
+  Future<void> _cameraQueue = Future<void>.value();
+  bool _cameraStartedOnce = false;
+
+  Future<void> _enqueueCameraOp(Future<void> Function() op) {
+    final next = _cameraQueue.then((_) => op()).catchError((Object _) {});
+    _cameraQueue = next;
+    return next;
+  }
+
+  Future<void> _startCamera() {
+    _wantCamera = true;
+    return _enqueueCameraOp(_startCameraNow);
+  }
+
+  /// True while the album or flash page covers this one, so coming back to
+  /// the foreground must not reopen a camera nobody can see.
+  bool _routeCovered = false;
+
+  Future<void> _resumeCamera() {
+    if (_routeCovered) return Future<void>.value();
+    if (_wantCamera && _controller != null) {
+      // Never released (e.g. only went inactive): just restart the analysis.
+      final ctrl = _controller!;
+      if (ctrl.value.isInitialized && !ctrl.value.isStreamingImages) {
+        unawaited(ctrl.startImageStream(_onFrame));
+      }
+      return Future<void>.value();
+    }
+    return _startCamera();
+  }
+
+  Future<void> _releaseCamera() {
+    _wantCamera = false;
+    return _enqueueCameraOp(_stopCameraNow);
+  }
+
+  Future<void> _startCameraNow() async {
+    if (!_wantCamera || !mounted || _controller != null) return;
+
+    final controller = CameraController(
       widget.camera,
       ResolutionPreset.max,
       enableAudio: false,
@@ -629,29 +859,113 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
           ? ImageFormatGroup.bgra8888
           : ImageFormatGroup.yuv420,
     );
+    _controller = controller;
 
     try {
-      await _controller!.initialize();
-      _minZoom = await _controller!.getMinZoomLevel();
-      _maxZoom = await _controller!.getMaxZoomLevel();
+      await controller.initialize();
+      _minZoom = await controller.getMinZoomLevel();
+      _maxZoom = await controller.getMaxZoomLevel();
       // Keep optical zoom at its native wide end — framing is done by the
       // format / focal simulation instead.
       if (_maxZoom > _minZoom) {
-        await _controller!.setZoomLevel(_minZoom);
+        await controller.setZoomLevel(_minZoom);
       }
-      await _controller!.startImageStream(_onFrame);
-      await _loadLensInfo();
-      unawaited(_probeCaptureMetadata());
+      // Released (or the page closed) while opening: the queued teardown
+      // closes it, or the widget's own dispose does.
+      if (!mounted) {
+        await controller.dispose();
+        return;
+      }
+      await controller.startImageStream(_onFrame);
+
+      final firstStart = !_cameraStartedOnce;
+      _cameraStartedOnce = true;
+      if (firstStart) {
+        await _loadLensInfo();
+        unawaited(_probeCaptureMetadata());
+      }
       if (!mounted) return;
       setState(() {
         _isInitialized = true;
         _status = 'Metering…';
       });
+
+      if (!firstStart) {
+        // A fresh camera forgets what it was told: restore the lock, or aim
+        // auto-exposure back at the metering spot.
+        if (_exposureLocked) {
+          try {
+            await controller.setExposureMode(ExposureMode.locked);
+          } on CameraException {
+            // The held reading still stands.
+          }
+        } else {
+          unawaited(_aimExposure());
+        }
+      }
     } catch (e) {
-      if (mounted) {
+      // Don't keep a half-open camera: the Retry button needs a clean slate.
+      if (identical(_controller, controller)) _controller = null;
+      try {
+        await controller.dispose();
+      } catch (_) {
+        // Nothing more to release.
+      }
+      if (mounted && _wantCamera) {
         setState(() => _errorMsg = 'Camera failed to start:\n$e');
       }
     }
+  }
+
+  Future<void> _stopCameraNow() async {
+    // A newer request to have the camera open wins.
+    if (_wantCamera) return;
+
+    // Let a capture or still metering finish rather than cut it off.
+    for (var i = 0; i < 30 && (_saving || _measuring) && mounted; i++) {
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+    }
+    if (_wantCamera) return;
+    if (_measuringDistance) await _cancelDistanceMeasure();
+
+    final ctrl = _controller;
+    if (ctrl == null) return;
+    _controller = null;
+
+    if (mounted) {
+      setState(() {
+        _isInitialized = false;
+        _errorMsg = '';
+      });
+      // Let the preview leave the tree before its controller goes. There may
+      // be no frame at all while backgrounded, so don't wait on one forever.
+      await WidgetsBinding.instance.endOfFrame.timeout(
+        const Duration(milliseconds: 300),
+        onTimeout: () {},
+      );
+    }
+
+    try {
+      if (ctrl.value.isStreamingImages) await ctrl.stopImageStream();
+    } catch (_) {
+      // Closing anyway.
+    }
+    try {
+      await ctrl.dispose();
+    } catch (_) {
+      // Already gone.
+    }
+  }
+
+  /// Pushes [route] with the camera closed underneath it, reopening it when
+  /// the route is popped.
+  Future<void> _pushWithoutCamera(Route<void> route) async {
+    _routeCovered = true;
+    await _releaseCamera();
+    if (!mounted) return;
+    await Navigator.of(context).push(route);
+    _routeCovered = false;
+    if (mounted) await _resumeCamera();
   }
 
   Future<void> _loadLensInfo() async {
@@ -1118,7 +1432,7 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
       final ev = _ev;
       if (ev != null) {
         final t = ExposureMath.shutterFromEv(
-          ev100: ev,
+          ev100: _nd.adjustEv100(ev),
           aperture: _aperture,
           iso: _meterIso,
         );
@@ -1126,7 +1440,7 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
           ExposureMath.snapShutter(
             t,
             options: _timedShutters,
-            allowUnlimited: _unlimitedBulbHolds,
+            allowUnlimited: true,
           ),
         );
       }
@@ -1139,7 +1453,7 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
       final ev = _ev;
       if (ev != null) {
         final n = ExposureMath.apertureFromEv(
-          ev100: ev,
+          ev100: _nd.adjustEv100(ev),
           shutterSeconds: _solveShutterSeconds,
           iso: _meterIso,
         );
@@ -1215,6 +1529,10 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
       _frameHeight = image.height;
       _frameFormat = image.format.group.name;
 
+      if (_multiSpotEnabled && !_measuringDistance) {
+        _updateMultiSpot(image, previewSize, crop);
+      }
+
       // Read the scene live. With capture metadata every frame carries the
       // exposure the camera used for it, so there is nothing to wait for.
       if (!_exposureLocked || _ev == null) {
@@ -1223,6 +1541,12 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
             reading.quality != LiveReadingQuality.unusable) {
           _reading = reading;
           _rawSceneEv = reading.sceneEv100;
+          // Calibration learns only from settled frames. "Fair" counts too: a
+          // phone that renders mid-tones brighter than sRGB never reaches
+          // "good", and the run's own spread check rejects an unsteady one.
+          if (_calibrationRun != null && reading.aeConverged) {
+            _calibrationRun!.add(reading.sceneEv100);
+          }
           _readingOutOfRange = false;
           _ev = LiveMeter.smooth(
             _ev,
@@ -1409,24 +1733,27 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
     if (!_solvingShutter) return ExposureMath.formatShutter(_shutter);
     final result = _compensationResult(0);
     if (result == null) return '—';
-    return result.limitLabel ?? result.snappedLabel;
+    return result.snappedLabel;
   }
 
   String get _displayedAperture {
     if (!_solvingAperture) return ExposureMath.formatAperture(_aperture);
     final result = _compensationResult(0);
     if (result == null) return '—';
-    return result.limitLabel ?? result.snappedLabel;
+    return result.snappedLabel;
   }
 
   /// Exact / snapped EC readout, plus `over`/`under` when beyond gear limits.
   ///
-  /// Scale matches the Hasselblad EV dial: **+** raises working EV (less
-  /// exposure → faster shutter / smaller aperture), **−** lowers it.
+  /// Photographic EC: **+** is more exposure (longer shutter / wider
+  /// aperture), **−** is less.
   _CompResult? _compensationResult(int compensationStops) {
     final ev = _ev;
     if (ev == null) return null;
-    final adjusted = ev + compensationStops;
+    // Compensation and the filter both cut what reaches the film, so they add.
+    final adjusted = _nd.adjustEv100(
+      ExposureMath.ev100WithCompensation(ev, compensationStops),
+    );
     if (_solvingShutter) {
       final seconds = ExposureMath.shutterFromEv(
         ev100: adjusted,
@@ -1452,7 +1779,9 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
           !seconds.isInfinite &&
           seconds > slowest * (1 + 1e-9) &&
           !unlimited) {
-        limit = 'under';
+        // Past the marked timed range — still show the hold time; the
+        // photographer needs 8″ / 2′ in the dark, not the word “under”.
+        limit = 'hold';
       }
       return _CompResult(
         exactLabel: ExposureMath.formatShutter(seconds),
@@ -1460,7 +1789,7 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
           ExposureMath.snapShutter(
             seconds,
             options: timed,
-            allowUnlimited: unlimited,
+            allowUnlimited: true,
           ),
         ),
         limitLabel: limit,
@@ -1501,21 +1830,36 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
   }
 
   void _openAlbum() {
-    Navigator.of(context).push(
-      MaterialPageRoute<void>(
-        builder: (_) => AlbumPage(film: _film),
+    unawaited(
+      _pushWithoutCamera(
+        MaterialPageRoute<void>(
+          builder: (_) => AlbumPage(film: _film),
+        ),
       ),
     );
   }
 
+  void _openChecklist() {
+    unawaited(() async {
+      await _pushWithoutCamera(
+        MaterialPageRoute<void>(
+          builder: (_) => ShootChecklistPage(filmId: widget.film.id),
+        ),
+      );
+      await _loadFrameCount();
+    }());
+  }
+
   void _openFlash() {
-    Navigator.of(context).push(
-      MaterialPageRoute<void>(
-        builder: (_) => FlashPage(
-          iso: _meterIso,
-          aperture: _aperture,
-          ambientEv: _ev,
-          initialDistance: _subjectDistanceM,
+    unawaited(
+      _pushWithoutCamera(
+        MaterialPageRoute<void>(
+          builder: (_) => FlashPage(
+            iso: _meterIso,
+            aperture: _aperture,
+            ambientEv: _ev,
+            initialDistance: _subjectDistanceM,
+          ),
         ),
       ),
     );
@@ -1564,16 +1908,13 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
               overflow: TextOverflow.ellipsis,
               style: const TextStyle(fontSize: 17, fontWeight: FontWeight.w600),
             ),
-            Text(
-              [
-                _film.rollFormatLabel,
-                _isoSubtitle,
-                if (_film.cameraLabel != null) _film.cameraLabel!,
-              ].join('  ·  '),
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              style: const TextStyle(fontSize: 11, color: Colors.white54),
-            ),
+            if (_film.cameraLabel != null)
+              Text(
+                _film.cameraLabel!,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(fontSize: 11, color: Colors.white54),
+              ),
           ],
         ),
         bottom: PreferredSize(
@@ -1582,6 +1923,17 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
             padding: const EdgeInsets.fromLTRB(4, 0, 4, 4),
             child: Row(
               children: [
+                Padding(
+                  padding: const EdgeInsets.only(left: 8, right: 4),
+                  child: Text(
+                    _film.rollFormatLabel,
+                    style: const TextStyle(
+                      color: Colors.white70,
+                      fontWeight: FontWeight.w600,
+                      fontSize: 13,
+                    ),
+                  ),
+                ),
                 TextButton.icon(
                   onPressed: _pickIso,
                   style: TextButton.styleFrom(
@@ -1733,6 +2085,12 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
                       height: viewSize.height,
                       child: GestureDetector(
                         onTapUp: _onTapUp,
+                        onVerticalDragEnd: (details) {
+                          final speed = details.primaryVelocity ?? 0;
+                          if (speed > 700 && !_measuringDistance) {
+                            _openChecklist();
+                          }
+                        },
                         child: Stack(
                           fit: StackFit.expand,
                           children: [
@@ -1776,6 +2134,21 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
                                 color: _accent,
                               ),
                             ),
+                            if (_multiSpotEnabled &&
+                                _multiSpot != null &&
+                                !_measuringDistance)
+                              IgnorePointer(
+                                child: CustomPaint(
+                                  painter: _MultiSpotPainter(
+                                    points: _multiSpot!.points,
+                                    labels: [
+                                      for (final p in _multiSpot!.points)
+                                        _multiSpotValue(p),
+                                    ],
+                                    colorOf: _multiSpotColor,
+                                  ),
+                                ),
+                              ),
                             if (_measuringDistance)
                               Positioned.fill(
                                 child: _distanceMeasureOverlay(),
@@ -1786,23 +2159,15 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
                               child: Column(
                                 crossAxisAlignment: CrossAxisAlignment.start,
                                 children: [
+                                  _chip(_whiteBalanceLabel),
+                                  const SizedBox(height: 6),
                                   _statusChip(),
-                                  if (_is645InSixBySix) ...[
-                                    const SizedBox(height: 6),
-                                    _chip('6×6 FOV · 645 gate'),
-                                  ],
                                   if (_subjectDistanceM != null &&
                                       !_measuringDistance) ...[
                                     const SizedBox(height: 6),
                                     _chip(
                                       'Dist ${_distanceEstimate?.displayPrefix ?? ''}'
                                       '${formatLength(_subjectDistanceM!, useFeet: false)}',
-                                    ),
-                                  ],
-                                  if (_lensInfo != null) ...[
-                                    const SizedBox(height: 6),
-                                    _chip(
-                                      'Lens ${_lensInfo!.focalLengthMm.toStringAsFixed(1)} mm',
                                     ),
                                   ],
                                   if (_simLimited) ...[
@@ -1833,11 +2198,42 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
                                   ),
                                 ),
                               ),
-                            Positioned(
-                              bottom: 8,
-                              left: 8,
-                              child: _chip(_whiteBalanceLabel),
-                            ),
+                            if (_multiSpotEnabled &&
+                                _multiSpot != null &&
+                                !_measuringDistance)
+                              Positioned(
+                                bottom: 8,
+                                left: 8,
+                                child: IgnorePointer(
+                                  child: _multiSpotLegend(_multiSpot!),
+                                ),
+                              ),
+                            if (!_focalDialOpen)
+                              Positioned(
+                                bottom: 8,
+                                right: 56,
+                                child: Material(
+                                  color: Colors.black54,
+                                  borderRadius: BorderRadius.circular(10),
+                                  child: IconButton(
+                                    tooltip: 'Multi-spot',
+                                    onPressed: _saving ? null : _toggleMultiSpot,
+                                    visualDensity: VisualDensity.compact,
+                                    padding: const EdgeInsets.all(8),
+                                    constraints: const BoxConstraints(
+                                      minWidth: 40,
+                                      minHeight: 40,
+                                    ),
+                                    icon: Icon(
+                                      Icons.blur_on,
+                                      size: 22,
+                                      color: _multiSpotEnabled
+                                          ? _accent
+                                          : Colors.white70,
+                                    ),
+                                  ),
+                                ),
+                              ),
                             if (!_focalDialOpen)
                               Positioned(
                                 bottom: 8,
@@ -1968,40 +2364,75 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.center,
         children: [
-          _albumButton(),
+          Expanded(
+            child: Row(
+              children: [
+                _albumButton(),
+                if (hint != null) ...[
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      hint,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w600,
+                        color: _captureHintError
+                            ? Colors.orangeAccent
+                            : Colors.white70,
+                      ),
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          ),
+          _shutterButton(),
           Expanded(
             child: Align(
               alignment: Alignment.centerRight,
               child: Row(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  if (hint != null) ...[
-                    ConstrainedBox(
-                      constraints: const BoxConstraints(maxWidth: 140),
-                      child: Text(
-                        hint,
-                        textAlign: TextAlign.right,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: TextStyle(
-                          fontSize: 12,
-                          fontWeight: FontWeight.w600,
-                          color: _captureHintError
-                              ? Colors.orangeAccent
-                              : Colors.white70,
-                        ),
-                      ),
-                    ),
-                    const SizedBox(width: 10),
-                  ],
+                  _checklistButton(),
+                  const SizedBox(width: 6),
                   _exposureLockButton(),
-                  const SizedBox(width: 10),
-                  _shutterButton(),
                 ],
               ),
             ),
           ),
         ],
+      ),
+    );
+  }
+
+  Widget _checklistButton() {
+    return GestureDetector(
+      onTap: _openChecklist,
+      child: Container(
+        height: 36,
+        padding: const EdgeInsets.symmetric(horizontal: 8),
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(18),
+          border: Border.all(color: Colors.white54, width: 1.5),
+        ),
+        child: const Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(Icons.checklist, size: 15, color: Colors.white70),
+            SizedBox(width: 4),
+            Text(
+              'Step',
+              style: TextStyle(
+                color: Colors.white70,
+                fontSize: 11,
+                fontWeight: FontWeight.w800,
+                letterSpacing: 0.4,
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -2120,13 +2551,31 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
   }
 
   Widget _albumButton() {
-    return IconButton(
-      tooltip: 'Album',
-      onPressed: _openAlbum,
-      visualDensity: VisualDensity.compact,
-      padding: EdgeInsets.zero,
-      constraints: const BoxConstraints(minWidth: 36, minHeight: 32),
-      icon: const Icon(Icons.photo_library_outlined, size: 22, color: Colors.white70),
+    return InkWell(
+      onTap: _openAlbum,
+      borderRadius: BorderRadius.circular(8),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 4),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Icon(
+              Icons.photo_library_outlined,
+              size: 22,
+              color: Colors.white70,
+            ),
+            const SizedBox(width: 4),
+            Text(
+              '$_frameCount',
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 13,
+                fontWeight: FontWeight.w800,
+              ),
+            ),
+          ],
+        ),
+      ),
     );
   }
 
@@ -2381,7 +2830,39 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
                   fontWeight: FontWeight.w600,
                 ),
               ),
+              const SizedBox(width: 6),
+              const Text(
+                '+ more light',
+                style: TextStyle(fontSize: 10, color: Colors.white38),
+              ),
               const Spacer(),
+              InkWell(
+                key: const ValueKey('nd-chip'),
+                onTap: _pickNd,
+                borderRadius: BorderRadius.circular(6),
+                child: Container(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
+                  decoration: BoxDecoration(
+                    borderRadius: BorderRadius.circular(6),
+                    border: Border.all(
+                      color: _nd.isNone ? Colors.white24 : _accent,
+                    ),
+                    color: _nd.isNone
+                        ? Colors.transparent
+                        : _accent.withValues(alpha: 0.16),
+                  ),
+                  child: Text(
+                    _nd.isNone ? 'ND off' : _nd.label,
+                    style: TextStyle(
+                      fontSize: 10,
+                      fontWeight: FontWeight.w700,
+                      color: _nd.isNone ? Colors.white54 : _accent,
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 8),
               Text(
                 solvingLabel,
                 style: TextStyle(
@@ -2418,9 +2899,7 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
   }) {
     final isZero = compensation == 0;
     final outOfRange = result?.limitLabel != null;
-    final value = result == null
-        ? '—'
-        : (result.limitLabel ?? result.snappedLabel);
+    final value = result == null ? '—' : result.snappedLabel;
     final exactValue = result?.exactLabel;
     final showExact = isZero &&
         exactValue != null &&
@@ -2982,6 +3461,24 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
     }
   }
 
+  Future<void> _pickNd() async {
+    final chosen = await _showWheelPicker<NdFilter>(
+      title: 'ND filter',
+      items: NdFilter.presets,
+      initial: _nd,
+      labelOf: (f) => f.label,
+    );
+    if (chosen != null && chosen != _nd) {
+      setState(() {
+        _nd = chosen;
+        _setCaptureHint(
+          chosen.isNone ? 'ND off' : '${chosen.name}: +${chosen.stopsLabel}',
+          clearAfter: const Duration(seconds: 2),
+        );
+      });
+    }
+  }
+
   Future<void> _pickShutter() async {
     final items = _availableShutters;
     final chosen = await _showWheelPicker<double>(
@@ -3042,6 +3539,109 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
   }
 
   // ------------------------------------------------------------- diagnostics
+
+  /// Matches the live meter to a trusted reference meter.
+  ///
+  /// The user aims at a surface, types the lens-scale EV their reference meter
+  /// reads for the same light, and the app averages the live video readings
+  /// over a second or two. The result replaces the calibration offset — the
+  /// metering pipeline itself is untouched.
+  Future<void> _calibrateToReference() async {
+    if (_exposureLocked) {
+      setState(
+        () => _setCaptureHint(
+          'Unlock exposure (AE-L) to calibrate',
+          error: true,
+          clearAfter: const Duration(seconds: 3),
+        ),
+      );
+      return;
+    }
+    if (_sample == null || _reading == null) {
+      setState(
+        () => _setCaptureHint(
+          'Nothing metered yet',
+          error: true,
+          clearAfter: const Duration(seconds: 2),
+        ),
+      );
+      return;
+    }
+
+    final reference = await _whileModalOpen(
+      () => showDialog<ReferenceExposure>(
+        context: context,
+        builder: (_) => ReferenceExposureDialog(
+          initialIso: _meterIso,
+          initial: _lastReference,
+        ),
+      ),
+    );
+    if (reference == null || !reference.isValid || !mounted) return;
+    _lastReference = reference;
+
+    final run = EvCalibrationRun();
+    _calibrationRun = run;
+    setState(
+      () => _setCaptureHint(
+        'Calibrating — hold steady',
+        clearAfter: const Duration(seconds: 6),
+      ),
+    );
+
+    // Frames arrive continuously; wait for enough settled ones, but not
+    // forever if the patch never settles.
+    final deadline = DateTime.now().add(const Duration(seconds: 6));
+    while (mounted && !run.isFull && DateTime.now().isBefore(deadline)) {
+      await Future<void>.delayed(const Duration(milliseconds: 80));
+    }
+    _calibrationRun = null;
+    if (!mounted) return;
+
+    final result = run.solve(reference.ev100);
+
+    switch (result.status) {
+      case EvCalibrationStatus.ok:
+        final offset = result.offset!;
+        await CalibrationStore.save(offset);
+        if (!mounted) return;
+        setState(() {
+          _calibration = offset;
+          _ev = null;
+          _setCaptureHint(
+            'Calibrated ${ExposureMath.formatStops(offset)} '
+            '(±${result.spread!.toStringAsFixed(2)}, ${result.samples} frames)',
+            clearAfter: const Duration(seconds: 4),
+          );
+        });
+      case EvCalibrationStatus.tooFewSamples:
+        setState(
+          () => _setCaptureHint(
+            'Spot never settled — aim at a mid-tone and retry',
+            error: true,
+            clearAfter: const Duration(seconds: 4),
+          ),
+        );
+      case EvCalibrationStatus.unstable:
+        setState(
+          () => _setCaptureHint(
+            'Readings drifted ±${result.spread!.toStringAsFixed(2)} EV — '
+            'hold steady under constant light',
+            error: true,
+            clearAfter: const Duration(seconds: 4),
+          ),
+        );
+      case EvCalibrationStatus.outOfRange:
+        setState(
+          () => _setCaptureHint(
+            'Off by ${ExposureMath.formatStops(result.offset!)} — '
+            'check the reference EV and film speed',
+            error: true,
+            clearAfter: const Duration(seconds: 5),
+          ),
+        );
+    }
+  }
 
   /// Measures the camera's white-balance bias against a light the user names.
   ///
@@ -3402,8 +4002,9 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
                     ),
                     const SizedBox(height: 6),
                     const Text(
-                      'Offset every reading to match a meter you trust. '
-                      'Lens transmission and sensor tuning vary between phones.',
+                      'Phones report ISO on their own scale, so every reading '
+                      'can be a constant stop or so off. Match to your camera '
+                      'to correct it, or nudge the offset by hand.',
                       style: TextStyle(fontSize: 12, color: Colors.white54),
                     ),
                     const SizedBox(height: 10),
@@ -3440,6 +4041,17 @@ class _ApertureDiaryPageState extends State<ApertureDiaryPage>
                           });
                         },
                         child: const Text('Reset'),
+                      ),
+                    ),
+                    Align(
+                      alignment: Alignment.centerLeft,
+                      child: FilledButton.tonalIcon(
+                        onPressed: () {
+                          Navigator.of(ctx).pop();
+                          unawaited(_calibrateToReference());
+                        },
+                        icon: const Icon(Icons.straighten, size: 16),
+                        label: const Text('Match to my camera'),
                       ),
                     ),
                     const Divider(height: 20, color: Colors.white12),
@@ -3652,6 +4264,87 @@ class _FilmFramePainter extends CustomPainter {
       gateHeightFrac != old.gateHeightFrac;
 }
 
+/// Draws the multi-spot markers: a colour-coded ring per spot with its value
+/// beside it. Labels are pushed apart so spots that land close together stay
+/// readable.
+class _MultiSpotPainter extends CustomPainter {
+  _MultiSpotPainter({
+    required this.points,
+    required this.labels,
+    required this.colorOf,
+  });
+
+  final List<MultiSpotPoint> points;
+  final List<String> labels;
+  final Color Function(MultiSpotRole) colorOf;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final placed = <Rect>[];
+
+    for (var i = 0; i < points.length; i++) {
+      final p = points[i];
+      final color = colorOf(p.role);
+      final c = Offset(p.x * size.width, p.y * size.height);
+
+      canvas.drawCircle(
+        c,
+        9,
+        Paint()..color = Colors.black.withValues(alpha: 0.45),
+      );
+      canvas.drawCircle(
+        c,
+        7,
+        Paint()
+          ..color = color
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 2.2,
+      );
+      canvas.drawCircle(c, 2.5, Paint()..color = color);
+
+      final text = TextPainter(
+        text: TextSpan(
+          text: labels[i],
+          style: TextStyle(
+            color: color,
+            fontSize: 12,
+            fontWeight: FontWeight.w700,
+          ),
+        ),
+        textDirection: TextDirection.ltr,
+      )..layout();
+
+      final w = text.width + 10;
+      final h = text.height + 4;
+      var left = c.dx + 13;
+      if (left + w > size.width - 2) left = c.dx - 13 - w;
+      var rect = Rect.fromLTWH(left, c.dy - h / 2, w, h);
+
+      // Nudge down past any label already drawn here.
+      for (var guard = 0;
+          guard < 8 && placed.any((r) => r.overlaps(rect));
+          guard++) {
+        rect = rect.shift(Offset(0, h + 2));
+      }
+      if (rect.bottom > size.height - 2) {
+        rect = rect.shift(Offset(0, size.height - 2 - rect.bottom));
+      }
+      if (rect.top < 2) rect = rect.shift(Offset(0, 2 - rect.top));
+      placed.add(rect);
+
+      canvas.drawRRect(
+        RRect.fromRectAndRadius(rect, const Radius.circular(5)),
+        Paint()..color = Colors.black.withValues(alpha: 0.62),
+      );
+      text.paint(canvas, Offset(rect.left + 5, rect.top + 2));
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _MultiSpotPainter old) =>
+      !identical(points, old.points) || !listEquals(labels, old.labels);
+}
+
 class _SpotPainter extends CustomPainter {
   final Offset point;
   final double radius;
@@ -3722,6 +4415,6 @@ class _CompResult {
   final String exactLabel;
   final String snappedLabel;
 
-  /// `over` / `under` when the exact solve is outside camera/lens range.
+  /// `over` / `hold` when the exact solve is outside camera/lens range.
   final String? limitLabel;
 }

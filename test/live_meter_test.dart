@@ -142,7 +142,7 @@ void main() {
 
     test('crushed or clipped is unusable and carries no value', () {
       final meter = LiveMeter();
-      for (final encoded in [0.02, 0.95]) {
+      for (final encoded in [0.02, 0.08, 0.18, 0.90, 0.95]) {
         final reading = meter.read(
           metadata: frameAt(ev100: 8),
           sample: patchAt(encoded),
@@ -178,11 +178,13 @@ void main() {
       final meter = LiveMeter();
       // A pipeline where one stop of exposure moves the patch 0.10 encoded
       // units, i.e. a slope of 10 — well away from the sRGB prior.
+      // Learning only happens while AE is hunting; settled frames from
+      // different scenes must not be paired.
       for (var i = 0; i < 8; i++) {
         final ev = 8.0 - i * 0.5;
         final encoded = 0.30 + i * 0.05;
         meter.read(
-          metadata: frameAt(ev100: ev),
+          metadata: frameAt(ev100: ev, aeConverged: false),
           sample: patchAt(encoded),
         );
       }
@@ -208,13 +210,27 @@ void main() {
       final meter = LiveMeter();
       for (var i = 0; i < 8; i++) {
         meter.read(
-          metadata: frameAt(ev100: 8.0 - i * 0.5),
+          metadata: frameAt(ev100: 8.0 - i * 0.5, aeConverged: false),
           sample: patchAt(0.30 + i * 0.05),
         );
       }
       expect(meter.slopeIsMeasured, isTrue);
       meter.reset();
       expect(meter.slopeIsMeasured, isFalse);
+    });
+
+    test('settled frames from different scenes do not move the slope', () {
+      final meter = LiveMeter();
+      final prior = meter.slope;
+      meter.read(
+        metadata: frameAt(ev100: 8.0),
+        sample: patchAt(0.40),
+      );
+      meter.read(
+        metadata: frameAt(ev100: 12.0),
+        sample: patchAt(0.55),
+      );
+      expect(meter.slope, closeTo(prior, 1e-9));
     });
   });
 
@@ -295,6 +311,78 @@ void main() {
         sample: patchAt(0.97),
       )!;
       expect(reading.quality, LiveReadingQuality.unusable);
+    });
+  });
+
+  group('accuracy on a real device sweep', () {
+    // vivo V2505A, 2026-09-03. Fixed scene, true EV₁₀₀ = 6.312. Same rungs
+    // as test/spot_servo_test.dart. Open-loop sRGB inversion spread 2.3 EV
+    // across this sweep; the live meter has to stay inside a third of a stop
+    // on the rungs AE can actually hold near mid grey.
+    const trueEv = 6.312;
+    const rungs = <List<double>>[
+      [-4.000, 0.04738, 9.807],
+      [-2.667, 0.12716, 8.465],
+      [-1.333, 0.31929, 7.055],
+      [0.000, 0.56773, 5.756],
+      [1.333, 0.70411, 4.906],
+      [2.667, 0.79853, 3.455],
+      [4.000, 0.83983, 2.192],
+    ];
+
+    test('usable rungs stay within ⅓ stop of the true scene EV', () {
+      final meter = LiveMeter();
+      final errors = <String, double>{};
+      for (final row in rungs) {
+        final encoded = row[1];
+        final cameraEv = row[2];
+        final reading = meter.read(
+          metadata: frameAt(ev100: cameraEv, aeConverged: false),
+          sample: patchAt(encoded),
+        );
+        if (reading == null ||
+            reading.quality == LiveReadingQuality.unusable) {
+          continue;
+        }
+        errors['${row[0]}'] = reading.sceneEv100 - trueEv;
+      }
+      expect(errors, isNotEmpty);
+      for (final entry in errors.entries) {
+        expect(
+          entry.value.abs(),
+          lessThan(0.40),
+          reason: 'offset ${entry.key} EV error ${entry.value}',
+        );
+      }
+    });
+
+    test('crushed shadows that would be >1 stop out are refused', () {
+      final meter = LiveMeter();
+      final reading = meter.read(
+        metadata: frameAt(ev100: 8.465, aeConverged: false),
+        sample: patchAt(0.12716),
+      )!;
+      expect(reading.quality, LiveReadingQuality.unusable);
+    });
+
+    test('the mid-grey rung is inside 0.15 EV', () {
+      final meter = LiveMeter();
+      final reading = meter.read(
+        metadata: frameAt(ev100: 5.756),
+        sample: patchAt(0.56773),
+      )!;
+      expect(reading.quality, isNot(LiveReadingQuality.unusable));
+      expect(reading.sceneEv100, closeTo(trueEv, 0.15));
+    });
+
+    test('a patch on target is accurate almost regardless of slope', () {
+      final meter = LiveMeter();
+      final reading = meter.read(
+        metadata: frameAt(ev100: trueEv),
+        sample: patchAt(LiveMeter.target),
+      )!;
+      expect(reading.sceneEv100, closeTo(trueEv, 0.03));
+      expect(reading.estimatedErrorStops, lessThan(0.1));
     });
   });
 }

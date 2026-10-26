@@ -147,6 +147,16 @@ class ExposureMath {
         0.0722 * srgbLut[b.clamp(0, 255)];
   }
 
+  /// Working EV₁₀₀ after exposure compensation.
+  ///
+  /// Photographic EC: **+1** is one stop *more* light (longer shutter / wider
+  /// aperture), so the EV used to solve is one stop lower. This is the
+  /// opposite of a Hasselblad EV dial, where a higher number means less
+  /// exposure.
+  static double ev100WithCompensation(double ev100, int compensationStops) {
+    return ev100 - compensationStops;
+  }
+
   /// Shutter time in seconds for a given EV₁₀₀, aperture, and film ISO.
   ///
   /// Equivalent to [shutterFromLensEv] after [lensEvFromEv100].
@@ -191,11 +201,11 @@ class ExposureMath {
     }
     if (seconds >= 60) {
       final mins = seconds / 60.0;
-      if ((mins - mins.round()).abs() < 0.05) return "${mins.round()}'";
+      if ((mins - mins.round()).abs() < 0.05) return '${mins.round()}m';
       final whole = seconds ~/ 60;
       final secs = (seconds - whole * 60).round().clamp(0, 59);
-      if (secs == 0) return "$whole'";
-      return "$whole'$secs\"";
+      if (secs == 0) return '${whole}m';
+      return '${whole}m$secs"';
     }
     if (seconds >= 1.0) {
       if ((seconds - seconds.round()).abs() < 0.05) {

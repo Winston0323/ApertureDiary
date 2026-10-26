@@ -30,6 +30,65 @@ void main() {
     });
   });
 
+  group('exposure compensation', () {
+    test('+EC lengthens shutter (more light), −EC shortens it', () {
+      const aperture = 2.8;
+      const iso = 100;
+      // 2″ at f/2.8, ISO 100.
+      final ev = ExposureMath.cameraEv100(
+        aperture: aperture,
+        shutterSeconds: 2.0,
+        iso: iso.toDouble(),
+      );
+      final plus3 = ExposureMath.shutterFromEv(
+        ev100: ExposureMath.ev100WithCompensation(ev, 3),
+        aperture: aperture,
+        iso: iso,
+      );
+      final minus3 = ExposureMath.shutterFromEv(
+        ev100: ExposureMath.ev100WithCompensation(ev, -3),
+        aperture: aperture,
+        iso: iso,
+      );
+      expect(plus3, closeTo(16.0, 0.05));
+      expect(minus3, closeTo(0.25, 0.01));
+      expect(plus3, greaterThan(2.0));
+      expect(minus3, lessThan(2.0));
+    });
+
+    test('+EC opens aperture when shutter is fixed', () {
+      const shutter = 1 / 125;
+      const iso = 100;
+      final ev = ExposureMath.cameraEv100(
+        aperture: 5.6,
+        shutterSeconds: shutter,
+        iso: iso.toDouble(),
+      );
+      final plus1 = ExposureMath.apertureFromEv(
+        ev100: ExposureMath.ev100WithCompensation(ev, 1),
+        shutterSeconds: shutter,
+        iso: iso,
+      );
+      expect(plus1, closeTo(4.0, 0.05));
+    });
+
+    test('low EV still formats as a long hold, not a blank', () {
+      final t = ExposureMath.shutterFromEv(
+        ev100: 0,
+        aperture: 2.8,
+        iso: 100,
+      );
+      expect(t, greaterThan(4));
+      expect(ExposureMath.formatShutter(t), isNot('—'));
+      expect(
+        ExposureMath.formatShutter(
+          ExposureMath.snapShutter(t, allowUnlimited: true),
+        ),
+        isNot('under'),
+      );
+    });
+  });
+
   group('Hasselblad lens EV', () {
     test('f/16 at 1/125 is lens EV ≈ 15', () {
       // log2(256 / (1/125)) = log2(32000) ≈ 14.97
@@ -206,6 +265,8 @@ void main() {
       expect(ExposureMath.formatShutter(1 / 60), '1/60');
       expect(ExposureMath.formatShutter(1.0), '1"');
       expect(ExposureMath.formatShutter(2.0), '2"');
+      expect(ExposureMath.formatShutter(60), '1m');
+      expect(ExposureMath.formatShutter(120), '2m');
       expect(ExposureMath.formatShutter(0), '—');
     });
 

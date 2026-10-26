@@ -20,6 +20,15 @@
         android:icon="@mipmap/ic_launcher"
         android:allowBackup="true"
         android:requestLegacyExternalStorage="true">
+        <!-- Vulkan on Adreno logs "R flip / V flip" every camera frame and can
+             invert the preview texture. Impeller GLES keeps the same renderer
+             family without that Y-flip path. -->
+        <meta-data
+            android:name="io.flutter.embedding.android.EnableImpeller"
+            android:value="true" />
+        <meta-data
+            android:name="io.flutter.embedding.android.ImpellerBackend"
+            android:value="opengles" />
         <activity
             android:name=".MainActivity"
             android:exported="true"

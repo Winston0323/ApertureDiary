@@ -1,10 +1,12 @@
+import 'dart:math' as math;
+
 import 'package:flutter/material.dart';
 
 import 'exposure.dart';
 import 'flash.dart';
 import 'units.dart';
 
-/// Side-by-side flash range dials.
+/// Horizontal flash range rulers.
 ///
 /// * **Power** axis — each manual power, with reach distance.
 /// * **Distance** axis — integer metres/feet, with the power that covers it.
@@ -30,15 +32,16 @@ class FlashRangeScale extends StatelessWidget {
   /// Where the subject actually is, shown for reference.
   final double? subjectDistance;
 
-  static const double _labelWidth = 40;
-  static const double _tickWidth = 12;
-  static const double _rowHeight = 26;
+  static const double _minTickWidth = 52;
+  static const double _axisHeight = 64;
 
   @override
   Widget build(BuildContext context) {
     final accent = Theme.of(context).colorScheme.primary;
+    // Weak/short on the left → full/long on the right.
     final powers = FlashMath.standardPowers.reversed.toList();
     final distances = _integerDistances();
+    final unit = useFeet ? 'ft' : 'm';
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -53,63 +56,49 @@ class FlashRangeScale extends StatelessWidget {
                 : accent.withValues(alpha: 0.85),
           ),
         ),
-        const SizedBox(height: 8),
-        Row(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Expanded(
-              child: _axisColumn(
-                title: 'Power',
-                valueTitle: useFeet ? 'ft' : 'm',
-                accent: accent,
-                child: Column(
-                  children: [
-                    for (final power in powers)
-                      _powerRow(power, accent),
-                  ],
-                ),
-              ),
-            ),
-            const SizedBox(width: 14),
-            Expanded(
-              child: _axisColumn(
-                title: useFeet ? 'ft' : 'm',
-                valueTitle: 'Power',
-                accent: accent,
-                child: Column(
-                  children: [
-                    for (final d in distances)
-                      _distanceRow(d, accent),
-                  ],
-                ),
-              ),
-            ),
+        const SizedBox(height: 10),
+        _axis(
+          title: 'Power',
+          valueTitle: unit,
+          accent: accent,
+          count: powers.length,
+          ticks: [
+            for (final power in powers) _powerTick(power, accent),
           ],
         ),
+        if (distances.isNotEmpty) ...[
+          const SizedBox(height: 14),
+          _axis(
+            title: unit,
+            valueTitle: 'Power',
+            accent: accent,
+            count: distances.length,
+            ticks: [
+              for (final d in distances) _distanceTick(d, accent),
+            ],
+          ),
+        ],
       ],
     );
   }
 
-  Widget _axisColumn({
+  Widget _axis({
     required String title,
     required String valueTitle,
     required Color accent,
-    required Widget child,
+    required int count,
+    required List<Widget> ticks,
   }) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         Row(
           children: [
-            SizedBox(
-              width: _labelWidth,
-              child: Text(
-                title,
-                textAlign: TextAlign.right,
-                style: const TextStyle(fontSize: 10, color: Colors.white38),
-              ),
+            Text(
+              title,
+              style: const TextStyle(fontSize: 10, color: Colors.white38),
             ),
-            const SizedBox(width: _tickWidth),
+            const Spacer(),
             Text(
               valueTitle,
               style: const TextStyle(fontSize: 10, color: Colors.white38),
@@ -117,23 +106,46 @@ class FlashRangeScale extends StatelessWidget {
           ],
         ),
         const SizedBox(height: 4),
-        Stack(
-          children: [
-            Positioned(
-              left: _labelWidth + _tickWidth / 2,
-              top: 4,
-              bottom: 4,
-              width: 1,
-              child: const ColoredBox(color: Colors.white12),
-            ),
-            child,
-          ],
+        LayoutBuilder(
+          builder: (context, constraints) {
+            final minWidth = count * _minTickWidth;
+            final width = math.max(minWidth, constraints.maxWidth);
+            final itemWidth = width / count;
+            final row = SizedBox(
+              width: width,
+              height: _axisHeight,
+              child: Stack(
+                children: [
+                  Positioned(
+                    left: itemWidth / 2,
+                    right: itemWidth / 2,
+                    top: 26,
+                    height: 1,
+                    child: const ColoredBox(color: Colors.white12),
+                  ),
+                  Row(
+                    children: [
+                      for (final tick in ticks)
+                        SizedBox(width: itemWidth, child: tick),
+                    ],
+                  ),
+                ],
+              ),
+            );
+            if (width > constraints.maxWidth + 0.5) {
+              return SingleChildScrollView(
+                scrollDirection: Axis.horizontal,
+                child: row,
+              );
+            }
+            return row;
+          },
         ),
       ],
     );
   }
 
-  Widget _powerRow(double power, Color accent) {
+  Widget _powerTick(double power, Color accent) {
     final distance = FlashMath.distanceAtPower(
       guideNumberIso100: guideNumberIso100,
       iso: iso,
@@ -143,15 +155,19 @@ class FlashRangeScale extends StatelessWidget {
     final selected = highlightedPower != null &&
         (power - highlightedPower!).abs() < 1e-9;
 
-    return _tickRow(
+    return _tick(
       accent: accent,
       selected: selected,
       axisLabel: FlashMath.formatPower(power),
       valueLabel: formatLength(distance, useFeet: useFeet),
+      key: ValueKey('flash-power-${FlashMath.formatPower(power)}'),
+      recommendedKey: selected
+          ? const ValueKey('flash-recommended-power')
+          : null,
     );
   }
 
-  Widget _distanceRow(int distanceUnits, Color accent) {
+  Widget _distanceTick(int distanceUnits, Color accent) {
     final metres = toMetres(distanceUnits.toDouble(), useFeet: useFeet);
     final exact = FlashMath.powerFraction(
       guideNumberIso100: guideNumberIso100,
@@ -166,7 +182,7 @@ class FlashRangeScale extends StatelessWidget {
             ? 'over'
             : FlashMath.formatPower(FlashMath.snapPower(exact));
 
-    return _tickRow(
+    return _tick(
       accent: accent,
       selected: selected,
       axisLabel: '$distanceUnits',
@@ -174,36 +190,42 @@ class FlashRangeScale extends StatelessWidget {
     );
   }
 
-  Widget _tickRow({
+  Widget _tick({
     required Color accent,
     required bool selected,
     required String axisLabel,
     required String valueLabel,
+    Key? key,
+    Key? recommendedKey,
   }) {
     return Container(
-      height: _rowHeight,
+      key: recommendedKey,
       decoration: selected
           ? BoxDecoration(
               color: accent.withValues(alpha: 0.12),
               borderRadius: BorderRadius.circular(6),
             )
           : null,
-      child: Row(
+      child: Column(
         children: [
           SizedBox(
-            width: _labelWidth,
-            child: Text(
-              axisLabel,
-              textAlign: TextAlign.right,
-              style: TextStyle(
-                fontSize: 12,
-                color: selected ? accent : Colors.white54,
-                fontWeight: selected ? FontWeight.w700 : FontWeight.w500,
+            height: 22,
+            child: Center(
+              child: Text(
+                axisLabel,
+                key: key,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  fontSize: 12,
+                  color: selected ? accent : Colors.white54,
+                  fontWeight: selected ? FontWeight.w700 : FontWeight.w500,
+                ),
               ),
             ),
           ),
           SizedBox(
-            width: _tickWidth,
+            height: 10,
             child: Center(
               child: selected
                   ? Container(
@@ -214,16 +236,21 @@ class FlashRangeScale extends StatelessWidget {
                         shape: BoxShape.circle,
                       ),
                     )
-                  : Container(width: 6, height: 1.5, color: Colors.white24),
+                  : Container(width: 1.5, height: 6, color: Colors.white24),
             ),
           ),
           Expanded(
-            child: Text(
-              valueLabel,
-              style: TextStyle(
-                fontSize: 12,
-                color: selected ? accent : Colors.white70,
-                fontWeight: selected ? FontWeight.w700 : FontWeight.w400,
+            child: Center(
+              child: Text(
+                valueLabel,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  fontSize: 11,
+                  color: selected ? accent : Colors.white70,
+                  fontWeight: selected ? FontWeight.w700 : FontWeight.w400,
+                ),
               ),
             ),
           ),
@@ -240,7 +267,7 @@ class FlashRangeScale extends StatelessWidget {
   }
 
   /// Distance ticks: 1, 2, 4, 5, then +5 — near → far, matching the power axis
-  /// (weak/short at top → full/long at bottom).
+  /// (weak/short on the left → full/long on the right).
   List<int> _integerDistances() {
     final full = FlashMath.distanceAtPower(
       guideNumberIso100: guideNumberIso100,
@@ -248,9 +275,8 @@ class FlashRangeScale extends StatelessWidget {
       aperture: aperture,
       fraction: 1,
     );
-    final maxU = full.isFinite && full > 0
-        ? convertLength(full, useFeet: useFeet).ceil().clamp(1, 200)
-        : 40;
+    if (!full.isFinite || full <= 0) return const [];
+    final maxU = convertLength(full, useFeet: useFeet).ceil().clamp(1, 200);
 
     const head = [1, 2, 4, 5];
     final out = <int>[];
@@ -260,7 +286,6 @@ class FlashRangeScale extends StatelessWidget {
     for (var d = 10; d <= maxU; d += 5) {
       out.add(d);
     }
-    // Always show at least the head that fits, or 1 alone.
     if (out.isEmpty) out.add(1);
     return out;
   }

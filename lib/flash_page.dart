@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import 'exposure.dart';
 import 'flash.dart';
@@ -6,7 +7,6 @@ import 'flash_prefs.dart';
 import 'flash_scale.dart';
 import 'number_input_dialog.dart';
 import 'units.dart';
-import 'wheel_dial.dart';
 
 const Color _accent = Color(0xFFFFB300);
 
@@ -212,41 +212,6 @@ class _FlashPageState extends State<FlashPage> {
     return entered.clamp(lowest, highest);
   }
 
-  Future<void> _pickAperture() async {
-    final chosen = await _showWheelPicker<double>(
-      title: 'Aperture',
-      items: ExposureMath.standardApertures,
-      initial: _aperture,
-      labelOf: ExposureMath.formatAperture,
-    );
-    if (chosen != null) setState(() => _aperture = chosen);
-  }
-
-  Future<T?> _showWheelPicker<T>({
-    required String title,
-    required List<T> items,
-    required T initial,
-    required String Function(T) labelOf,
-  }) {
-    var index = items.indexOf(initial);
-    if (index < 0) index = 0;
-
-    return showModalBottomSheet<T>(
-      context: context,
-      backgroundColor: const Color(0xFF161616),
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
-      ),
-      builder: (_) => WheelDialSheet<T>(
-        title: title,
-        items: items,
-        initialIndex: index,
-        labelOf: labelOf,
-        accent: _accent,
-      ),
-    );
-  }
-
   @override
   Widget build(BuildContext context) {
     final result = _result;
@@ -258,70 +223,71 @@ class _FlashPageState extends State<FlashPage> {
         title: const Text('Flash'),
       ),
       body: SafeArea(
-        child: ListView(
-          padding: const EdgeInsets.fromLTRB(16, 8, 16, 24),
+        child: Column(
           children: [
-            Row(
-              children: [
-                Expanded(
-                  child: _readOnlyTile(
-                    label: 'Film ISO',
-                    value: '$_iso',
+            Expanded(
+              child: ListView(
+                padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
+                children: [
+                  Row(
+                    children: [
+                      Expanded(
+                        child: _readOnlyTile(
+                          label: 'Film ISO',
+                          value: '$_iso',
+                        ),
+                      ),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: _pickerTile(
+                          label: 'Guide no. (ISO 100)',
+                          value: formatNumber(_convertLength(_guideNumber)),
+                          onTap: _promptGuideNumber,
+                          icon: Icons.edit_outlined,
+                        ),
+                      ),
+                    ],
                   ),
-                ),
-                const SizedBox(width: 10),
-                Expanded(
-                  child: _pickerTile(
-                    label: 'Aperture',
-                    value: ExposureMath.formatAperture(_aperture),
-                    onTap: _pickAperture,
-                    emphasize: true,
+                  const SizedBox(height: 10),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: _pickerTile(
+                          label: 'Distance',
+                          value: _formatLength(_distance),
+                          onTap: _promptDistance,
+                          icon: Icons.edit_outlined,
+                        ),
+                      ),
+                      const SizedBox(width: 10),
+                      SizedBox(
+                        width: 72,
+                        child: _pickerTile(
+                          label: 'Unit',
+                          value: _useFeet ? 'ft' : 'm',
+                          onTap: () => setState(() => _useFeet = !_useFeet),
+                          icon: Icons.swap_horiz,
+                        ),
+                      ),
+                    ],
                   ),
-                ),
-              ],
+                  const SizedBox(height: 10),
+                  _buildResultCard(result),
+                  const SizedBox(height: 12),
+                  FlashRangeScale(
+                    guideNumberIso100: _guideNumber,
+                    iso: _iso,
+                    aperture: _aperture,
+                    useFeet: _useFeet,
+                    highlightedPower: _recommendedPower,
+                    subjectDistance: _distance,
+                  ),
+                ],
+              ),
             ),
-            const SizedBox(height: 10),
-            Row(
-              children: [
-                Expanded(
-                  child: _pickerTile(
-                    label: 'Guide no. (ISO 100)',
-                    value: formatNumber(_convertLength(_guideNumber)),
-                    onTap: _promptGuideNumber,
-                    icon: Icons.edit_outlined,
-                  ),
-                ),
-                const SizedBox(width: 10),
-                Expanded(
-                  child: _pickerTile(
-                    label: 'Distance',
-                    value: _formatLength(_distance),
-                    onTap: _promptDistance,
-                    icon: Icons.edit_outlined,
-                  ),
-                ),
-                const SizedBox(width: 10),
-                SizedBox(
-                  width: 72,
-                  child: _pickerTile(
-                    label: 'Unit',
-                    value: _useFeet ? 'ft' : 'm',
-                    onTap: () => setState(() => _useFeet = !_useFeet),
-                    icon: Icons.swap_horiz,
-                  ),
-                ),
-              ],
-            ),
-            const SizedBox(height: 10),
-            _buildResultCard(result),
-            const SizedBox(height: 12),
-            FlashRangeScale(
-              guideNumberIso100: _guideNumber,
-              iso: _iso,
-              aperture: _aperture,
-              useFeet: _useFeet,
-              highlightedPower: _recommendedPower,
-              subjectDistance: _distance,
+            _ApertureDial(
+              value: _aperture,
+              onChanged: (v) => setState(() => _aperture = v),
             ),
           ],
         ),
@@ -506,4 +472,294 @@ class _FlashResult {
     this.note,
     this.warning,
   });
+}
+
+/// Horizontal f-stop ring, pinned to the bottom like a lens aperture dial.
+class _ApertureDial extends StatefulWidget {
+  const _ApertureDial({
+    required this.value,
+    required this.onChanged,
+  });
+
+  final double value;
+  final ValueChanged<double> onChanged;
+
+  @override
+  State<_ApertureDial> createState() => _ApertureDialState();
+}
+
+class _ApertureDialState extends State<_ApertureDial> {
+  static const double _itemWidth = 56;
+  static const List<double> _stops = ExposureMath.standardApertures;
+
+  late final ScrollController _controller;
+  late int _index;
+  bool _syncing = false;
+
+  int _nearestIndex(double aperture) {
+    var best = 0;
+    var bestDiff = double.infinity;
+    for (var i = 0; i < _stops.length; i++) {
+      final d = (_stops[i] - aperture).abs();
+      if (d < bestDiff) {
+        bestDiff = d;
+        best = i;
+      }
+    }
+    return best;
+  }
+
+  double _offsetForIndex(int i) => i * _itemWidth;
+
+  int _indexForOffset(double offset) {
+    if (_stops.isEmpty) return 0;
+    return (offset / _itemWidth)
+        .round()
+        .clamp(0, _stops.length - 1);
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    _index = _nearestIndex(widget.value);
+    _controller = ScrollController(
+      initialScrollOffset: _offsetForIndex(_index),
+    );
+    _controller.addListener(_onScroll);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || !_controller.hasClients) return;
+      _syncing = true;
+      _controller.jumpTo(_offsetForIndex(_index));
+      _syncing = false;
+    });
+  }
+
+  @override
+  void didUpdateWidget(covariant _ApertureDial oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    final next = _nearestIndex(widget.value);
+    if (next == _index) return;
+    if (!_controller.hasClients) return;
+    if (_controller.position.isScrollingNotifier.value) return;
+    _index = next;
+    _syncing = true;
+    _controller.jumpTo(_offsetForIndex(next));
+    _syncing = false;
+  }
+
+  @override
+  void dispose() {
+    _controller.removeListener(_onScroll);
+    _controller.dispose();
+    super.dispose();
+  }
+
+  void _onScroll() {
+    if (_syncing || !_controller.hasClients) return;
+    final next = _indexForOffset(_controller.offset);
+    if (next == _index) return;
+    HapticFeedback.selectionClick();
+    _index = next;
+    widget.onChanged(_stops[next]);
+    setState(() {});
+  }
+
+  void _onScrollEnd() {
+    if (!_controller.hasClients) return;
+    final target = _offsetForIndex(_indexForOffset(_controller.offset));
+    if ((target - _controller.offset).abs() < 0.5) return;
+    _controller.animateTo(
+      target,
+      duration: const Duration(milliseconds: 160),
+      curve: Curves.easeOutCubic,
+    );
+  }
+
+  String _ringLabel(double n) {
+    if (n < 10) {
+      final s = n.toStringAsFixed(1);
+      return s.endsWith('.0') ? n.toStringAsFixed(0) : s;
+    }
+    return n.toStringAsFixed(0);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final current = _stops[_index];
+    return Material(
+      color: Colors.transparent,
+      child: Container(
+        height: 118,
+        decoration: BoxDecoration(
+          border: const Border(
+            top: BorderSide(color: Color(0x22FFB300)),
+          ),
+          gradient: LinearGradient(
+            begin: Alignment.topCenter,
+            end: Alignment.bottomCenter,
+            colors: [
+              Colors.black.withValues(alpha: 0.0),
+              Colors.black.withValues(alpha: 0.55),
+              Colors.black.withValues(alpha: 0.92),
+            ],
+            stops: const [0.0, 0.28, 1.0],
+          ),
+        ),
+        child: Column(
+          children: [
+            const SizedBox(height: 8),
+            const Text(
+              'Aperture',
+              style: TextStyle(
+                color: Colors.white54,
+                fontSize: 11,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+            Text(
+              ExposureMath.formatAperture(current),
+              style: const TextStyle(
+                color: _accent,
+                fontSize: 24,
+                fontWeight: FontWeight.w800,
+                height: 1.1,
+                letterSpacing: -0.4,
+              ),
+            ),
+            Expanded(
+              child: LayoutBuilder(
+                builder: (context, constraints) {
+                  final sidePad =
+                      (constraints.maxWidth - _itemWidth) / 2;
+                  return Stack(
+                    alignment: Alignment.center,
+                    children: [
+                      NotificationListener<ScrollNotification>(
+                        onNotification: (n) {
+                          if (n is ScrollEndNotification) {
+                            _onScrollEnd();
+                          }
+                          return false;
+                        },
+                        child: SingleChildScrollView(
+                          controller: _controller,
+                          scrollDirection: Axis.horizontal,
+                          physics: const _StopSnapPhysics(
+                            itemWidth: _itemWidth,
+                            parent: BouncingScrollPhysics(),
+                          ),
+                          child: SizedBox(
+                            width:
+                                _stops.length * _itemWidth + sidePad * 2,
+                            height: constraints.maxHeight,
+                            child: Padding(
+                              padding: EdgeInsets.symmetric(
+                                horizontal: sidePad,
+                              ),
+                              child: Row(
+                                children: [
+                                  for (var i = 0; i < _stops.length; i++)
+                                    SizedBox(
+                                      width: _itemWidth,
+                                      child: GestureDetector(
+                                        behavior: HitTestBehavior.opaque,
+                                        onTap: () {
+                                          _controller.animateTo(
+                                            _offsetForIndex(i),
+                                            duration: const Duration(
+                                              milliseconds: 180,
+                                            ),
+                                            curve: Curves.easeOutCubic,
+                                          );
+                                        },
+                                        child: Center(
+                                          child: Text(
+                                            _ringLabel(_stops[i]),
+                                            style: TextStyle(
+                                              fontSize:
+                                                  i == _index ? 18 : 14,
+                                              fontWeight: i == _index
+                                                  ? FontWeight.w800
+                                                  : FontWeight.w500,
+                                              color: i == _index
+                                                  ? _accent
+                                                  : Colors.white54,
+                                            ),
+                                          ),
+                                        ),
+                                      ),
+                                    ),
+                                ],
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                      IgnorePointer(
+                        child: Center(
+                          child: Container(
+                            width: _itemWidth,
+                            height: 36,
+                            decoration: BoxDecoration(
+                              borderRadius: BorderRadius.circular(8),
+                              border: Border.all(
+                                color: _accent.withValues(alpha: 0.55),
+                              ),
+                              color: _accent.withValues(alpha: 0.08),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ],
+                  );
+                },
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// Snaps a horizontal f-stop ring onto whole stop centres.
+class _StopSnapPhysics extends ScrollPhysics {
+  const _StopSnapPhysics({required this.itemWidth, super.parent});
+
+  final double itemWidth;
+
+  @override
+  _StopSnapPhysics applyTo(ScrollPhysics? ancestor) {
+    return _StopSnapPhysics(
+      itemWidth: itemWidth,
+      parent: buildParent(ancestor),
+    );
+  }
+
+  double _targetPixels(ScrollMetrics position, double velocity) {
+    final projected = position.pixels + velocity.clamp(-900, 900) * 0.12;
+    final index = (projected / itemWidth).round();
+    return (index * itemWidth).clamp(
+      position.minScrollExtent,
+      position.maxScrollExtent,
+    );
+  }
+
+  @override
+  Simulation? createBallisticSimulation(
+    ScrollMetrics position,
+    double velocity,
+  ) {
+    final target = _targetPixels(position, velocity);
+    if ((target - position.pixels).abs() < 0.5 && velocity.abs() < 20) {
+      return null;
+    }
+    return ScrollSpringSimulation(
+      const SpringDescription(mass: 0.8, stiffness: 180, damping: 22),
+      position.pixels,
+      target,
+      velocity,
+      tolerance: toleranceFor(position),
+    );
+  }
 }

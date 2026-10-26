@@ -7,6 +7,7 @@ import 'package:flutter/foundation.dart';
 
 import 'color_temperature.dart';
 import 'exposure.dart';
+import 'multi_spot.dart';
 import 'tone_curve.dart';
 
 /// The exposure the camera actually used for a frame, read from EXIF.
@@ -282,8 +283,11 @@ SpotMapping? mapSpotToFrame({
 
 /// Averages a circular patch of the frame around the mapped spot.
 ///
-/// Averaging in linear light (not in gamma-encoded values) is what makes this
-/// a photometric measurement rather than a perceptual one.
+/// Encoded luminance is taken from the Y plane on YUV frames (the luma the
+/// ISP actually produced) rather than a YUV→RGB→Rec.709 round trip, which
+/// clips saturated colours and is slower. Speculars are trimmed so a glint
+/// does not pull the spot a stop bright. RGB is still averaged, on a coarser
+/// grid, for white-balance.
 SpotSample? sampleSpot({
   required CameraImage image,
   required Offset spot,
@@ -307,14 +311,15 @@ SpotSample? sampleSpot({
   if (reader == null) return null;
 
   final radius = mapping.radius.clamp(1.0, 200.0);
-  // Cap the sample grid so frame processing stays cheap.
-  final step = max(1, (2 * radius / 15).ceil());
+  // Denser than before: luma is a single byte, so a ~24-sample diameter
+  // stays cheap at 30 fps and averages sensor noise down.
+  final step = max(1, (2 * radius / 24).ceil());
+  final rgbStep = step * 2;
   final radiusSquared = radius * radius;
 
-  double linearSum = 0;
-  double encodedSum = 0;
+  final encodedSamples = <double>[];
   int rSum = 0, gSum = 0, bSum = 0;
-  int count = 0;
+  int rgbCount = 0;
 
   final cx = mapping.x.round();
   final cy = mapping.y.round();
@@ -328,20 +333,22 @@ SpotSample? sampleSpot({
       final x = cx + dx;
       if (x < 0 || x >= image.width) continue;
 
-      final pixel = reader.read(x, y);
-      if (pixel == null) continue;
+      final luma = reader.luma(x, y);
+      if (luma == null) continue;
+      encodedSamples.add(luma / 255.0);
 
-      linearSum += ExposureMath.linearLuminance8(pixel.r, pixel.g, pixel.b);
-      encodedSum += (0.2126 * pixel.r + 0.7152 * pixel.g + 0.0722 * pixel.b) / 255.0;
-      rSum += pixel.r;
-      gSum += pixel.g;
-      bSum += pixel.b;
-      count++;
+      if (dx % rgbStep == 0 && dy % rgbStep == 0) {
+        final pixel = reader.read(x, y);
+        if (pixel == null) continue;
+        rSum += pixel.r;
+        gSum += pixel.g;
+        bSum += pixel.b;
+        rgbCount++;
+      }
     }
   }
 
-  if (count == 0) {
-    // Patch fell outside the frame; fall back to the single centre pixel.
+  if (encodedSamples.isEmpty) {
     final pixel = reader.read(
       cx.clamp(0, image.width - 1),
       cy.clamp(0, image.height - 1),
@@ -357,13 +364,150 @@ SpotSample? sampleSpot({
     );
   }
 
+  final encoded = _trimmedMean(encodedSamples);
+  if (encoded == null) return null;
+
+  double linearSum = 0;
+  var linearCount = 0;
+  for (final e in encodedSamples) {
+    if ((e - encoded).abs() > 0.35) continue;
+    linearSum += ExposureMath.srgbToLinear(e);
+    linearCount++;
+  }
+
+  final rgb = rgbCount == 0
+      ? reader.read(
+          cx.clamp(0, image.width - 1),
+          cy.clamp(0, image.height - 1),
+        )
+      : null;
+
   return SpotSample(
-    linearLuminance: linearSum / count,
-    encodedLuminance: encodedSum / count,
-    r: rSum ~/ count,
-    g: gSum ~/ count,
-    b: bSum ~/ count,
+    linearLuminance:
+        linearCount == 0 ? ExposureMath.srgbToLinear(encoded) : linearSum / linearCount,
+    encodedLuminance: encoded,
+    r: rgbCount == 0 ? (rgb?.r ?? 0) : rSum ~/ rgbCount,
+    g: rgbCount == 0 ? (rgb?.g ?? 0) : gSum ~/ rgbCount,
+    b: rgbCount == 0 ? (rgb?.b ?? 0) : bSum ~/ rgbCount,
   );
+}
+
+/// Samples the whole viewfinder as a grid of cells, for the multi-spot view.
+///
+/// Cells are laid out in viewfinder space with square-ish proportions and a
+/// small [margin] kept clear of the edge, where lens falloff would otherwise
+/// make every frame's darkest spot a corner. Each cell is the mean of a 3×3
+/// cluster of luma samples, so a single hot pixel cannot become the "highest"
+/// value. [luma] reads the encoded luma (0–255) at a frame pixel.
+///
+/// [toPreview] maps a viewfinder point into preview space when the focal
+/// simulation has cropped the frame; [radiusScale] is that crop fraction, so a
+/// cell covers the same part of the picture the user sees.
+List<LumaCell>? sampleLumaGrid({
+  required int frameWidth,
+  required int frameHeight,
+  required int? Function(int x, int y) luma,
+  required Size widgetSize,
+  required int quarterTurns,
+  required bool mirror,
+  int columns = 18,
+  double margin = 0.05,
+  Offset Function(Offset normalized)? toPreview,
+  double radiusScale = 1.0,
+}) {
+  if (frameWidth <= 0 || frameHeight <= 0) return null;
+  if (widgetSize.width <= 0 || widgetSize.height <= 0) return null;
+  if (columns < 1) return null;
+
+  final span = 1.0 - 2 * margin;
+  final cellWidth = widgetSize.width * span / columns;
+  final rows = (widgetSize.height * span / cellWidth).round().clamp(4, 48);
+  final cellHeight = widgetSize.height * span / rows;
+  final halfCell = min(cellWidth, cellHeight) / 2 * radiusScale;
+
+  final cells = <LumaCell>[];
+  for (var r = 0; r < rows; r++) {
+    for (var c = 0; c < columns; c++) {
+      final nx = margin + span * (c + 0.5) / columns;
+      final ny = margin + span * (r + 0.5) / rows;
+      final point = Offset(nx, ny);
+      final spot = toPreview == null ? point : toPreview(point);
+
+      final mapping = mapSpotToFrame(
+        frameWidth: frameWidth,
+        frameHeight: frameHeight,
+        quarterTurns: quarterTurns,
+        mirror: mirror,
+        widgetSize: widgetSize,
+        spot: spot,
+        radiusInWidgetPixels: halfCell,
+      );
+      if (mapping == null) continue;
+
+      final reach = (mapping.radius * 0.6).clamp(1.0, 100.0);
+      var sum = 0.0;
+      var count = 0;
+      for (var dy = -1; dy <= 1; dy++) {
+        for (var dx = -1; dx <= 1; dx++) {
+          final x = (mapping.x + dx * reach).round().clamp(0, frameWidth - 1);
+          final y = (mapping.y + dy * reach).round().clamp(0, frameHeight - 1);
+          final v = luma(x, y);
+          if (v == null) continue;
+          sum += v;
+          count++;
+        }
+      }
+      if (count == 0) continue;
+      cells.add(LumaCell(x: nx, y: ny, encoded: sum / count / 255.0));
+    }
+  }
+  return cells.isEmpty ? null : cells;
+}
+
+/// [sampleLumaGrid] over a live [CameraImage].
+List<LumaCell>? sampleLumaGridFromImage({
+  required CameraImage image,
+  required Size widgetSize,
+  required int quarterTurns,
+  required bool mirror,
+  int columns = 18,
+  Offset Function(Offset normalized)? toPreview,
+  double radiusScale = 1.0,
+}) {
+  final reader = _PixelReader.of(image);
+  if (reader == null) return null;
+  return sampleLumaGrid(
+    frameWidth: image.width,
+    frameHeight: image.height,
+    luma: reader.luma,
+    widgetSize: widgetSize,
+    quarterTurns: quarterTurns,
+    mirror: mirror,
+    columns: columns,
+    toPreview: toPreview,
+    radiusScale: radiusScale,
+  );
+}
+
+/// Mean after dropping the brightest and darkest tails (speculars / noise).
+double? _trimmedMean(List<double> values, {double trim = 0.1}) {
+  if (values.isEmpty) return null;
+  if (values.length < 8) {
+    var sum = 0.0;
+    for (final v in values) {
+      sum += v;
+    }
+    return sum / values.length;
+  }
+  final sorted = [...values]..sort();
+  final drop = (sorted.length * trim).floor().clamp(1, sorted.length ~/ 5);
+  var sum = 0.0;
+  var n = 0;
+  for (var i = drop; i < sorted.length - drop; i++) {
+    sum += sorted[i];
+    n++;
+  }
+  return n == 0 ? null : sum / n;
 }
 
 @immutable
@@ -377,6 +521,10 @@ class _Rgb {
 /// Reads gamma-encoded RGB out of a [CameraImage] regardless of plane layout.
 abstract class _PixelReader {
   _Rgb? read(int x, int y);
+
+  /// Encoded luma 0–255. On YUV this is the Y plane; on BGRA it is Rec.709
+  /// of the stored bytes, without a colour-matrix round trip.
+  int? luma(int x, int y);
 
   static _PixelReader? of(CameraImage image) {
     switch (image.format.group) {
@@ -438,6 +586,14 @@ class _Yuv420Reader implements _PixelReader {
     final b = (yd + 1.772 * ud).clamp(0.0, 255.0);
     return _Rgb(r.round(), g.round(), b.round());
   }
+
+  @override
+  int? luma(int x, int y) {
+    final yStride = yPlane.bytesPerPixel ?? 1;
+    final yIndex = y * yPlane.bytesPerRow + x * yStride;
+    if (yIndex < 0 || yIndex >= yPlane.bytes.length) return null;
+    return yPlane.bytes[yIndex] & 0xFF;
+  }
 }
 
 class _Bgra8888Reader implements _PixelReader {
@@ -455,5 +611,14 @@ class _Bgra8888Reader implements _PixelReader {
       plane.bytes[index + 1] & 0xFF,
       plane.bytes[index] & 0xFF,
     );
+  }
+
+  @override
+  int? luma(int x, int y) {
+    final pixel = read(x, y);
+    if (pixel == null) return null;
+    return (0.2126 * pixel.r + 0.7152 * pixel.g + 0.0722 * pixel.b)
+        .round()
+        .clamp(0, 255);
   }
 }

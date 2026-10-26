@@ -40,19 +40,21 @@ void main() {
     await pumpScale(tester);
     for (final power in FlashMath.standardPowers) {
       expect(
-        find.text(FlashMath.formatPower(power)),
+        find.byKey(ValueKey('flash-power-${FlashMath.formatPower(power)}')),
         findsOneWidget,
         reason: 'missing ${FlashMath.formatPower(power)}',
       );
     }
   });
 
-  testWidgets('runs from the weakest setting down to full power',
+  testWidgets('runs from the weakest setting across to full power',
       (tester) async {
     await pumpScale(tester);
-    final weakest = tester.getCenter(find.text('1/128'));
-    final full = tester.getCenter(find.text('1/1'));
-    expect(weakest.dy, lessThan(full.dy));
+    final weakest =
+        tester.getCenter(find.byKey(const ValueKey('flash-power-1/128')));
+    final full =
+        tester.getCenter(find.byKey(const ValueKey('flash-power-1/1')));
+    expect(weakest.dx, lessThan(full.dx));
   });
 
   testWidgets('shows the distance each setting covers', (tester) async {
@@ -75,23 +77,34 @@ void main() {
 
   testWidgets('marks the recommended setting', (tester) async {
     await pumpScale(tester, highlightedPower: 0.25);
-    expect(find.text('set this'), findsOneWidget);
+    expect(
+      find.byKey(const ValueKey('flash-recommended-power')),
+      findsOneWidget,
+    );
 
-    final marker = tester.getCenter(find.text('set this'));
-    final quarter = tester.getCenter(find.text('1/4'));
-    expect(marker.dy, closeTo(quarter.dy, 1.0));
+    final marker = tester.getCenter(
+      find.byKey(const ValueKey('flash-recommended-power')),
+    );
+    final quarter =
+        tester.getCenter(find.byKey(const ValueKey('flash-power-1/4')));
+    expect(marker.dx, closeTo(quarter.dx, 1.0));
   });
 
   testWidgets('marks nothing when out of reach', (tester) async {
     await pumpScale(tester);
-    expect(find.text('set this'), findsNothing);
+    expect(
+      find.byKey(const ValueKey('flash-recommended-power')),
+      findsNothing,
+    );
   });
 
   testWidgets('header states the aperture, ISO, and subject distance',
       (tester) async {
     await pumpScale(tester, aperture: 2.8, iso: 400, subjectDistance: 3);
-    expect(find.text('Covers at f/2.8 · ISO 400'), findsOneWidget);
-    expect(find.text('subject 3 m'), findsOneWidget);
+    expect(
+      find.text('f/2.8 · ISO 400  ·  subject 3 m'),
+      findsOneWidget,
+    );
   });
 
   testWidgets('an unusable guide number leaves the distances blank',
